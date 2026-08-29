@@ -5,7 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import events, photos, guests, auth
 from app.services.db import connect_to_db, close_db_connection
 from app.core.config import get_settings
-from subprocess import Popen
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -19,7 +18,7 @@ async def lifespan(app: FastAPI):
 
 settings = get_settings()
 
-app = FastAPI(title="Drive Photo Sharing API", lifespan=lifespan, redirect_slashes=False,)
+app = FastAPI(title="PicShare API", lifespan=lifespan, redirect_slashes=False)
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,4 +37,4 @@ app.include_router(guests.router)
 
 @app.get("/")
 def read_root():
-    return {"message": "Drive Photo Sharing API is running"}
+    return {"message": "PicShare API is running"}

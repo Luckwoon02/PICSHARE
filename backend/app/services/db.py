@@ -1,6 +1,5 @@
 import aiosqlite
 import os
-import json
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -25,7 +24,6 @@ class Database:
                 name TEXT NOT NULL,
                 slug TEXT UNIQUE NOT NULL,
                 date TEXT NOT NULL,
-                drive_folder_url TEXT,
                 secret_code TEXT,
                 sync_status TEXT DEFAULT 'idle',
                 last_sync_at TEXT,
@@ -38,8 +36,8 @@ class Database:
                 id TEXT PRIMARY KEY,
                 event_id TEXT NOT NULL,
                 original_file_name TEXT,
-                drive_file_id TEXT,
-                thumbnail_path TEXT,
+                s3_object_key TEXT,
+                thumbnail_s3_key TEXT,
                 width INTEGER,
                 height INTEGER,
                 faces_count INTEGER DEFAULT 0,
@@ -54,8 +52,7 @@ class Database:
                 id TEXT PRIMARY KEY,
                 photo_id TEXT NOT NULL,
                 event_id TEXT NOT NULL,
-                embedding_vector TEXT NOT NULL,
-                bounding_box TEXT NOT NULL,
+                rekognition_face_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (photo_id) REFERENCES photos (id),
                 FOREIGN KEY (event_id) REFERENCES events (id)
@@ -78,18 +75,19 @@ class Database:
                 FOREIGN KEY (event_id) REFERENCES events (id)
             )
         """)
+
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_event ON photos (event_id)")
         await self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_photos_drive ON photos (drive_file_id)"
-        )
+            "CREATE INDEX IF NOT EXISTS idx_photos_s3_key ON photos (s3_object_key)")
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_faces_event ON faces (event_id)")
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_faces_rekognition ON faces (rekognition_face_id)")
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_guests_event ON guests (event_id)")
         await self.connection.commit()
 
-    # Helper methods to make API migration easier
     async def fetch_one(self, query, params=()):
         async with self.connection.execute(query, params) as cursor:
             row = await cursor.fetchone()

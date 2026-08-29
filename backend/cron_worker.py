@@ -1,41 +1,41 @@
+"""
+cron_worker.py — startup worker for PicShare.
+
+Runs once on container start to:
+  1. Connect to the database.
+  2. Execute recovery tasks (reset stuck events/photos from interrupted uploads).
+  3. Exit cleanly.
+
+Run alongside the main API worker in docker-compose via a separate service,
+or as a post-start hook. No long-running loop is required now that No-IP DNS
+management has been removed.
+"""
 import asyncio
 import logging
 import sys
 import os
 
-# Add the current directory to sys.path so we can import 'app'
 sys.path.append(os.getcwd())
 
-from app.services.cron_jobs import start_cron_jobs
 from app.services.db import connect_to_db, close_db_connection
 from app.services.recovery import run_recovery_tasks
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler()],
 )
 
+
 async def main():
-    logging.info("Starting Cron Worker...")
-    
-    # Connect to DB for recovery and potential cron tasks
+    logging.info("PicShare cron worker starting...")
     await connect_to_db()
-    
     try:
-        # Run recovery tasks once
         await run_recovery_tasks()
-        
-        # Start the cron jobs
-        await start_cron_jobs()
-        
-        # Keep the process alive
-        while True:
-            await asyncio.sleep(14400)
-    except asyncio.CancelledError:
-        logging.info("Cron Worker stopping...")
+        logging.info("PicShare cron worker finished.")
     finally:
         await close_db_connection()
+
 
 if __name__ == "__main__":
     try:

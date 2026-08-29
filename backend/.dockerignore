@@ -1,13 +1,25 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Local environment — never bake secrets into the image
 .env
-.venv
+
+# Virtual environments
+.venv/
 env/
 venv/
-app.db
-uploads/
-thumbnails/
+
+# Local data directories — all storage is on S3/SQLite mounted volume
+data/uploads/
+data/thumbnails/
+data/insightface/
+data/accounts/
+
+# Database file (mounted as a volume in docker-compose)
+data/app.db
+
+# VCS & editor noise
 .git/
 .github/
 .vscode/

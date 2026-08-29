@@ -6,104 +6,156 @@ import asyncio
 import io
 from typing import List
 from datetime import datetime
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Response
+from fastapi.responses import RedirectResponse
 from PIL import Image
 from app.core.config import get_settings
 from app.services.db import db
-from app.services.drive_service import drive_service
-from app.services.face_service import face_service
+from app.services.s3_service import s3_service
+from app.services.rekognition_service import rekognition_service
 from app.services.thumbnail_service import thumbnail_service
 
 router = APIRouter(prefix="/photos", tags=["photos"])
 settings = get_settings()
 
+# Local staging dirs (originals live here briefly before S3 upload)
 os.makedirs(settings.UPLOAD_ROOT, exist_ok=True)
 os.makedirs(settings.THUMBNAIL_ROOT, exist_ok=True)
 
 
-def format_photo(row):
-    if not row: return None
-    d = dict(row)
-    d["_id"] = d.pop("id")
-    if d.get("created_at"):
-        d["created_at"] = datetime.fromisoformat(d["created_at"])
-    return d
+# ---------------------------------------------------------------------------
+# S3 key helpers
+# ---------------------------------------------------------------------------
+
+def s3_original_key(event_id: str, photo_id: str, ext: str) -> str:
+    return f"events/{event_id}/originals/{photo_id}.{ext}"
+
+def s3_thumbnail_key(event_id: str, photo_id: str) -> str:
+    return f"events/{event_id}/thumbnails/{photo_id}.jpg"
 
 
-async def process_photo(photo_id: str,
-                        event_id: str,
-                        event_slug: str,
-                        original_path: str,
-                        filename: str,
-                        drive_file_id: str = None):
+# ---------------------------------------------------------------------------
+# Background processing
+# ---------------------------------------------------------------------------
+
+async def process_photo(
+    photo_id: str,
+    event_id: str,
+    event_slug: str,
+    original_path: str,
+    filename: str,
+):
+    """
+    Full processing pipeline:
+    1. Read image dimensions.
+    2. Upload original to S3.
+    3. Generate thumbnail locally, upload to S3.
+    4. Index faces with Rekognition (against the event collection).
+    5. Store face rows (rekognition_face_id) in the faces table.
+    6. Update photos row: s3_object_key, thumbnail_s3_key, dimensions,
+       faces_count, status=processed.
+    7. Remove local staging files.
+    """
     try:
-        # 1. Upload to Drive ONLY if we don't already have a drive_file_id
-        if not drive_file_id:
-            drive_file_id = await drive_service.upload_photo(original_path,
-                                                             event_slug,
-                                                             filename=filename)
+        file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "jpg"
 
-        # 2. Generate Thumbnail
-        thumb_path = os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg")
-        await asyncio.to_thread(thumbnail_service.generate_thumbnail,
-                                original_path, thumb_path)
-
-        # 3. Extract faces
-        faces_data = await asyncio.to_thread(face_service.get_embeddings,
-                                             original_path)
-
-        # 4. Get image size
-        def get_image_size(path):
+        # 1. Image dimensions (cheap, local)
+        def get_image_size(path: str):
             with Image.open(path) as img:
                 return img.size
 
         width, height = await asyncio.to_thread(get_image_size, original_path)
 
-        await db.execute(
-            """
-            UPDATE photos SET 
-                drive_file_id = ?, 
-                thumbnail_path = ?, 
-                width = ?, 
-                height = ?, 
-                faces_count = ?, 
-                status = ?
-            WHERE id = ?
-        """, (drive_file_id, thumb_path, width, height, len(faces_data),
-              "processed", photo_id))
+        # 2. Upload original to S3
+        s3_key = s3_original_key(event_id, photo_id, file_ext)
+        content_type = _content_type(file_ext)
+        await s3_service.upload_file(original_path, s3_key, content_type)
 
-        # 5. Store Faces
-        for f in faces_data:
+        # 3. Thumbnail — generate locally then push to S3
+        thumb_local = os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg")
+        await asyncio.to_thread(
+            thumbnail_service.generate_thumbnail, original_path, thumb_local
+        )
+        thumb_s3_key = s3_thumbnail_key(event_id, photo_id)
+        await s3_service.upload_file(thumb_local, thumb_s3_key, "image/jpeg")
+
+        # 4. Rekognition face indexing — image is already in S3
+        faces_data = await rekognition_service.index_photo_faces(
+            s3_key, photo_id, event_id
+        )
+
+        # 5. Persist face rows
+        now = datetime.utcnow().isoformat()
+        for face in faces_data:
             face_id = str(uuid.uuid4())
-            embedding_json = json.dumps(f["embedding"].tolist(
-            ) if hasattr(f["embedding"], "tolist") else f["embedding"])
-            bbox_json = json.dumps({
-                "x": f["bbox"][0],
-                "y": f["bbox"][1],
-                "w": f["bbox"][2] - f["bbox"][0],
-                "h": f["bbox"][3] - f["bbox"][1]
-            })
-
             await db.execute(
                 """
-                INSERT INTO faces (id, photo_id, event_id, embedding_vector, bounding_box, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (face_id, photo_id, event_id, embedding_json, bbox_json,
-                  datetime.utcnow().isoformat()))
+                INSERT INTO faces (id, photo_id, event_id, rekognition_face_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (face_id, photo_id, event_id, face["rekognition_face_id"], now),
+            )
+
+        # 6. Update photo record
+        await db.execute(
+            """
+            UPDATE photos SET
+                s3_object_key    = ?,
+                thumbnail_s3_key = ?,
+                width            = ?,
+                height           = ?,
+                faces_count      = ?,
+                status           = ?
+            WHERE id = ?
+            """,
+            (s3_key, thumb_s3_key, width, height, len(faces_data), "processed", photo_id),
+        )
+
+        # 7. Clean up local staging files
+        _remove_silently(original_path)
+        _remove_silently(thumb_local)
+
+        print(
+            f"[process_photo] Done: {photo_id} | "
+            f"{len(faces_data)} face(s) indexed | {width}x{height}"
+        )
 
     except Exception as e:
-        print(f"Error processing photo {photo_id}: {e}")
-        await db.execute("UPDATE photos SET status = ? WHERE id = ?",
-                         ("error", photo_id))
+        print(f"[process_photo] Error for {photo_id}: {e}")
+        await db.execute(
+            "UPDATE photos SET status = ? WHERE id = ?", ("error", photo_id)
+        )
 
+
+def _content_type(ext: str) -> str:
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }.get(ext.lower(), "image/jpeg")
+
+
+def _remove_silently(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        print(f"[cleanup] Could not remove {path}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Upload endpoint
+# ---------------------------------------------------------------------------
 
 @router.post("/upload")
-async def upload_photos(background_tasks: BackgroundTasks,
-                        event_id: str,
-                        files: List[UploadFile] = File(...)):
-    row = await db.fetch_one("SELECT slug FROM events WHERE id = ?",
-                             (event_id, ))
+async def upload_photos(
+    background_tasks: BackgroundTasks,
+    event_id: str,
+    files: List[UploadFile] = File(...),
+):
+    row = await db.fetch_one("SELECT slug FROM events WHERE id = ?", (event_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
     event_slug = row["slug"]
@@ -111,358 +163,251 @@ async def upload_photos(background_tasks: BackgroundTasks,
     processed_count = 0
     for file in files:
         photo_id = str(uuid.uuid4())
-        file_ext = file.filename.split(".")[-1]
-        original_path = os.path.join(settings.UPLOAD_ROOT,
-                                     f"{photo_id}.{file_ext}")
+        file_ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "jpg"
+        original_path = os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{file_ext}")
 
-        with open(original_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        with open(original_path, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
 
         await db.execute(
             """
             INSERT INTO photos (id, event_id, original_file_name, status, created_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (photo_id, event_id, file.filename, "pending",
-              datetime.utcnow().isoformat()))
+            """,
+            (photo_id, event_id, file.filename, "pending", datetime.utcnow().isoformat()),
+        )
 
-        background_tasks.add_task(process_photo, photo_id, event_id,
-                                  event_slug, original_path, file.filename)
+        background_tasks.add_task(
+            process_photo, photo_id, event_id, event_slug, original_path, file.filename
+        )
         processed_count += 1
 
     return {
         "message": f"Successfully started processing {processed_count} photos",
-        "event_id": event_id
+        "event_id": event_id,
     }
 
 
-async def run_sync_task(event_id: str):
-    try:
-        row = await db.fetch_one("SELECT * FROM events WHERE id = ?",
-                                 (event_id, ))
-        if not row or not row.get("drive_folder_url"):
-            print(
-                f"Sync failed: Event {event_id} not found or no drive_folder_url"
-            )
-            return
-        event = dict(row)
-
-        await db.execute("UPDATE events SET sync_status = ? WHERE id = ?",
-                         ("syncing", event_id))
-
-        folder_id = drive_service.get_folder_id_from_url(
-            event["drive_folder_url"])
-        print(f"Starting sync for folder: {folder_id}")
-
-        files_to_sync = await drive_service.list_files_recursive(folder_id)
-        print(f"Found {len(files_to_sync)} files in Drive total")
-
-        new_files = []
-        pending_photos = []
-        for f in files_to_sync:
-            existing = await db.fetch_one(
-                "SELECT id, status FROM photos WHERE drive_file_id = ?", (f["id"], ))
-            if not existing:
-                new_files.append(f)
-            elif existing["status"] == "pending":
-                photo_id :str = existing["id"]
-                file_ext :str = f['name'].split(".")[-1] if "." in f['name'] else "jpg"  
-                original_path :str = os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{file_ext}")
-                pending_photos.append((photo_id, original_path, f))
-            else:
-                print(f"Skipping already synced file: {f['name']}")
-
-        print(f"Identified {len(pending_photos)} pending photos to index")
-        print(f"Identified {len(new_files)} new photos to index")
-
-        # Pre-register all new photos
-        inserted_items = []
-        for f in new_files:
-            photo_id = str(uuid.uuid4())
-            file_ext = f['name'].split(".")[-1] if "." in f['name'] else "jpg"
-            original_path = os.path.join(settings.UPLOAD_ROOT,
-                                         f"{photo_id}.{file_ext}")
-
-            await db.execute(
-                """
-                INSERT INTO photos (id, event_id, original_file_name, drive_file_id, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (photo_id, event_id, f['name'], f["id"], "pending",
-                  datetime.utcnow().isoformat()))
-            inserted_items.append((photo_id, original_path, f))
-
-        # download and process
-        for photo_id, original_path, f in pending_photos + inserted_items:
-            try:
-                print(f"Downloading & Processing: {f['name']}")
-                content, filename = await drive_service.download_file(f["id"])
-                if not content:
-                    await db.execute(
-                        "UPDATE photos SET status = ? WHERE id = ?",
-                        ("error", photo_id))
-                    continue
-
-                with open(original_path, "wb") as buffer:
-                    buffer.write(content)
-
-                await process_photo(photo_id,
-                                    event_id,
-                                    event["slug"],
-                                    original_path,
-                                    filename,
-                                    drive_file_id=f["id"])
-            except Exception as loop_err:
-                print(f"Error processing synced photo {f['name']}: {loop_err}")
-                await db.execute("UPDATE photos SET status = ? WHERE id = ?",
-                                 ("error", photo_id))
-
-        await db.execute(
-            """
-            UPDATE events SET sync_status = ?, last_sync_at = ? WHERE id = ?
-        """, ("completed", datetime.utcnow().isoformat(), event_id))
-        print(f"Sync completed successfully for event: {event_id}")
-    except Exception as e:
-        print(f"Sync task fatal error: {e}")
-        await db.execute("UPDATE events SET sync_status = ? WHERE id = ?",
-                         ("error", event_id))
-
+# ---------------------------------------------------------------------------
+# Sync — removed (Drive is gone)
+# ---------------------------------------------------------------------------
 
 @router.post("/sync/{event_id}")
-async def start_sync(event_id: str, background_tasks: BackgroundTasks):
-    row = await db.fetch_one(
-        "SELECT drive_folder_url FROM events WHERE id = ?", (event_id, ))
-    if not row:
-        raise HTTPException(status_code=404, detail="Event not found")
+async def start_sync(event_id: str):
+    return Response(
+        status_code=410,
+        content=b"Drive sync removed. Upload photos directly via POST /photos/upload.",
+    )
 
-    if not row["drive_folder_url"]:
-        raise HTTPException(status_code=400,
-                            detail="Drive folder URL not configured")
 
-    background_tasks.add_task(run_sync_task, event_id)
-    return {"message": "Sync started in background"}
-
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
 
 @router.get("/status/{event_id}")
 async def get_event_status(event_id: str):
-    row = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id, ))
+    row = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
     event = dict(row)
 
-    res = await db.fetch_one(
-        "SELECT COUNT(*) as total FROM photos WHERE event_id = ?",
-        (event_id, ))
-    total = res["total"]
+    counts = await db.fetch_one(
+        """
+        SELECT
+            COUNT(*)                                        AS total,
+            SUM(status = 'pending')                        AS pending,
+            SUM(status = 'pending_upload')                 AS pending_upload,
+            SUM(status = 'processed')                      AS processed,
+            SUM(status = 'error')                          AS errors,
+            COALESCE(SUM(faces_count), 0)                  AS total_faces
+        FROM photos WHERE event_id = ?
+        """,
+        (event_id,),
+    )
 
-    res = await db.fetch_one(
-        "SELECT COUNT(*) as pending FROM photos WHERE event_id = ? AND status = 'pending'",
-        (event_id, ))
-    pending = res["pending"]
-
-    res = await db.fetch_one(
-        "SELECT COUNT(*) as processed FROM photos WHERE event_id = ? AND status = 'processed'",
-        (event_id, ))
-    processed = res["processed"]
-
-    res = await db.fetch_one(
-        "SELECT COUNT(*) as errors FROM photos WHERE event_id = ? AND status = 'error'",
-        (event_id, ))
-    errors = res["errors"]
-
-    res = await db.fetch_one(
-        "SELECT SUM(faces_count) as total_faces FROM photos WHERE event_id = ?",
-        (event_id, ))
-    total_faces = res["total_faces"] or 0
+    total = counts["total"] or 0
+    processed = counts["processed"] or 0
 
     return {
         "event_id": event_id,
         "sync_status": event.get("sync_status", "idle"),
         "last_sync_at": event.get("last_sync_at"),
         "total": total,
-        "pending": pending,
+        "pending": (counts["pending"] or 0) + (counts["pending_upload"] or 0),
         "processed": processed,
-        "errors": errors,
-        "total_faces": total_faces,
-        "progress": (processed / total * 100) if total > 0 else 0
+        "errors": counts["errors"] or 0,
+        "total_faces": counts["total_faces"] or 0,
+        "progress": (processed / total * 100) if total > 0 else 0,
     }
 
 
+# ---------------------------------------------------------------------------
+# Gallery — includes presigned thumbnail URL per photo
+# ---------------------------------------------------------------------------
+
 @router.get("/event/{event_id}/gallery")
 async def get_event_photos(event_id: str, page: int = 1, limit: int = 100):
-    """Get all photos for an event with pagination"""
     offset = (page - 1) * limit
-    
-    # Get total count
+
     count_result = await db.fetch_one(
-        "SELECT COUNT(*) as total FROM photos WHERE event_id = ?",
-        (event_id,)
+        "SELECT COUNT(*) as total FROM photos WHERE event_id = ?", (event_id,)
     )
     total = count_result["total"]
-    
-    # Get photos
-    photos = await db.fetch_all(
+
+    rows = await db.fetch_all(
         """
-        SELECT id, original_file_name, thumbnail_path, width, height, 
-               faces_count, status, created_at, drive_file_id
-        FROM photos 
+        SELECT id, original_file_name, s3_object_key, thumbnail_s3_key,
+               width, height, faces_count, status, created_at
+        FROM photos
         WHERE event_id = ?
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
         """,
-        (event_id, limit, offset)
+        (event_id, limit, offset),
     )
-    
+
+    photos = []
+    for p in rows:
+        entry = dict(p)
+        # Add presigned thumbnail URL when the key is available
+        if p["thumbnail_s3_key"]:
+            try:
+                entry["presigned_thumbnail_url"] = await s3_service.get_presigned_url(
+                    p["thumbnail_s3_key"], expiry_seconds=3600
+                )
+            except Exception as e:
+                print(f"[gallery] presign error for {p['id']}: {e}")
+                entry["presigned_thumbnail_url"] = None
+        else:
+            entry["presigned_thumbnail_url"] = None
+        photos.append(entry)
+
     return {
-        "photos": [dict(p) for p in photos],
+        "photos": photos,
         "total": total,
         "page": page,
         "limit": limit,
-        "total_pages": (total + limit - 1) // limit
+        "total_pages": (total + limit - 1) // limit if total > 0 else 0,
     }
 
 
+# ---------------------------------------------------------------------------
+# Single-photo delete
+# ---------------------------------------------------------------------------
+
 @router.delete("/delete/{photo_id}")
 async def delete_photo(photo_id: str):
-    """Delete a single photo and its associated data"""
     photo = await db.fetch_one("SELECT * FROM photos WHERE id = ?", (photo_id,))
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
-    
+
     try:
-        # Delete original photo files
-        for ext in ['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG', 'webp', 'WEBP']:
-            original_path = os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}")
-            if os.path.exists(original_path):
-                try:
-                    os.remove(original_path)
-                except Exception as e:
-                    print(f"Error deleting original {original_path}: {e}")
-        
-        # Delete thumbnail
-        thumbnail_path = photo.get("thumbnail_path")
-        if thumbnail_path and os.path.exists(thumbnail_path):
-            try:
-                os.remove(thumbnail_path)
-            except Exception as e:
-                print(f"Error deleting thumbnail {thumbnail_path}: {e}")
-        
-        # Delete from database
+        # S3 cleanup
+        if photo.get("s3_object_key"):
+            await s3_service.delete_object(photo["s3_object_key"])
+        if photo.get("thumbnail_s3_key"):
+            await s3_service.delete_object(photo["thumbnail_s3_key"])
+
+        # Local staging cleanup (may still be present if processing failed mid-way)
+        for ext in ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG", "webp", "WEBP"]:
+            _remove_silently(os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}"))
+        _remove_silently(os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg"))
+
         await db.execute("DELETE FROM faces WHERE photo_id = ?", (photo_id,))
         await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
-        
+
         return {"message": "Photo deleted successfully"}
     except Exception as e:
-        print(f"Error deleting photo {photo_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error deleting photo: {str(e)}")
+        print(f"[delete_photo] Error for {photo_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error deleting photo: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Bulk delete
+# ---------------------------------------------------------------------------
 
 @router.post("/delete/bulk")
 async def delete_photos_bulk(photo_ids: List[str]):
-    """Delete multiple photos and their associated data"""
     deleted_count = 0
     errors = []
-    
+
     for photo_id in photo_ids:
         try:
             photo = await db.fetch_one("SELECT * FROM photos WHERE id = ?", (photo_id,))
             if not photo:
                 errors.append(f"Photo {photo_id} not found")
                 continue
-            
-            # Delete original photo files
-            for ext in ['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG', 'webp', 'WEBP']:
-                original_path = os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}")
-                if os.path.exists(original_path):
-                    try:
-                        os.remove(original_path)
-                    except Exception as e:
-                        print(f"Error deleting original {original_path}: {e}")
-            
-            # Delete thumbnail
-            thumbnail_path = photo.get("thumbnail_path")
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                try:
-                    os.remove(thumbnail_path)
-                except Exception as e:
-                    print(f"Error deleting thumbnail {thumbnail_path}: {e}")
-            
-            # Delete from database
+
+            if photo.get("s3_object_key"):
+                await s3_service.delete_object(photo["s3_object_key"])
+            if photo.get("thumbnail_s3_key"):
+                await s3_service.delete_object(photo["thumbnail_s3_key"])
+
+            for ext in ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG", "webp", "WEBP"]:
+                _remove_silently(os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}"))
+            _remove_silently(os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg"))
+
             await db.execute("DELETE FROM faces WHERE photo_id = ?", (photo_id,))
             await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
             deleted_count += 1
         except Exception as e:
-            errors.append(f"Error deleting photo {photo_id}: {str(e)}")
-            print(f"Error in bulk delete for {photo_id}: {e}")
-    
+            errors.append(f"Error deleting photo {photo_id}: {e}")
+            print(f"[bulk_delete] Error for {photo_id}: {e}")
+
     return {
         "message": f"Deleted {deleted_count} photos",
         "deleted_count": deleted_count,
-        "errors": errors
+        "errors": errors,
     }
 
 
+# ---------------------------------------------------------------------------
+# Serving — all return presigned S3 URLs
+# ---------------------------------------------------------------------------
+
 @router.get("/original/{photo_id}")
 async def get_original(photo_id: str):
-    row = await db.fetch_one("SELECT * FROM photos WHERE id = ?", (photo_id, ))
+    """Returns a presigned S3 URL for the original image (redirects browser)."""
+    row = await db.fetch_one(
+        "SELECT s3_object_key, original_file_name FROM photos WHERE id = ?", (photo_id,)
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Photo not found")
-    photo = dict(row)
+    if not row["s3_object_key"]:
+        raise HTTPException(status_code=404, detail="Photo not yet uploaded to S3")
 
-    local_path = None
-    for ext in ['jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG', 'webp']:
-        path = os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}")
-        if os.path.exists(path):
-            local_path = path
-            break
-
-    if local_path:
-        return FileResponse(local_path)
-
-    if photo.get("drive_file_id"):
-        try:
-            content, filename = await drive_service.download_file(
-                photo["drive_file_id"])
-            if content:
-                return StreamingResponse(io.BytesIO(content),
-                                         media_type="image/jpeg")
-        except Exception as e:
-            print(f"Drive fetch error: {e}")
-
-    raise HTTPException(status_code=404, detail="Original file not found")
+    url = await s3_service.get_presigned_url(row["s3_object_key"], expiry_seconds=3600)
+    return RedirectResponse(url=url, status_code=302)
 
 
 @router.get("/thumbnail/{photo_id}")
 async def get_thumbnail(photo_id: str):
-    row = await db.fetch_one("SELECT thumbnail_path FROM photos WHERE id = ?",
-                             (photo_id, ))
-    if not row or not row["thumbnail_path"]:
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    """Returns a presigned S3 URL for the thumbnail (redirects browser)."""
+    row = await db.fetch_one(
+        "SELECT thumbnail_s3_key FROM photos WHERE id = ?", (photo_id,)
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if not row["thumbnail_s3_key"]:
+        raise HTTPException(status_code=404, detail="Thumbnail not yet uploaded to S3")
 
-    if not os.path.exists(row["thumbnail_path"]):
-        raise HTTPException(status_code=404,
-                            detail="Thumbnail file not found on disk")
-
-    return FileResponse(row["thumbnail_path"])
+    url = await s3_service.get_presigned_url(row["thumbnail_s3_key"], expiry_seconds=3600)
+    return RedirectResponse(url=url, status_code=302)
 
 
 @router.get("/download/{photo_id}")
 async def download_photo(photo_id: str):
-    row = await db.fetch_one("SELECT drive_file_id FROM photos WHERE id = ?",
-                             (photo_id, ))
-    if not row or not row["drive_file_id"]:
+    """Returns a presigned S3 URL that forces a file download."""
+    row = await db.fetch_one(
+        "SELECT s3_object_key, original_file_name FROM photos WHERE id = ?", (photo_id,)
+    )
+    if not row:
         raise HTTPException(status_code=404, detail="Photo not found")
+    if not row["s3_object_key"]:
+        raise HTTPException(status_code=404, detail="Photo not yet uploaded to S3")
 
-    try:
-        content, filename = await drive_service.download_file(
-            row["drive_file_id"])
-        if content is None:
-            raise HTTPException(status_code=500,
-                                detail="Failed to download from Drive")
-
-        return StreamingResponse(io.BytesIO(content),
-                                 media_type="application/octet-stream",
-                                 headers={
-                                     "Content-Disposition":
-                                     f"attachment; filename={filename}"
-                                 })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    filename = row.get("original_file_name") or f"{photo_id}.jpg"
+    url = await s3_service.get_presigned_download_url(
+        row["s3_object_key"], filename, expiry_seconds=3600
+    )
+    return RedirectResponse(url=url, status_code=302)
