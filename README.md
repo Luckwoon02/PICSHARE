@@ -3,7 +3,7 @@
 **PICSHARE** is a full-stack event photo sharing platform that uses **AWS Rekognition** for cloud-based face matching and **AWS S3** for scalable photo storage. Admins upload event photos, and guests find all their pictures instantly by submitting a single selfie.
 
 ![Project Status](https://img.shields.io/badge/Status-Beta-orange)
-![License](https://img.shields.io/badge/License-MIT-blue)
+
 ![Stack](https://img.shields.io/badge/Stack-FastAPI%20|%20Next.js%20|%20AWS%20Rekognition-green)
 
 ---
