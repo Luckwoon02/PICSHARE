@@ -334,4 +334,4 @@ All endpoints are documented interactively at `/docs`.
 
 ---
 
-**Built by [Yash Oswal](https://github.com/yashoswalyo) with ❤️**
+**Built by Kaushik Ghosh with ❤️**

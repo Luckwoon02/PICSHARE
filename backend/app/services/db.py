@@ -42,6 +42,7 @@ class Database:
                 height INTEGER,
                 faces_count INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
+                error_detail TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (event_id) REFERENCES events (id)
             )
@@ -87,6 +88,16 @@ class Database:
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_guests_event ON guests (event_id)")
         await self.connection.commit()
+
+        # Safe migration: add error_detail column to existing databases.
+        # SQLite raises OperationalError if the column already exists — silently ignore it.
+        try:
+            await self.connection.execute(
+                "ALTER TABLE photos ADD COLUMN error_detail TEXT"
+            )
+            await self.connection.commit()
+        except Exception:
+            pass  # Column already exists — nothing to do
 
     async def fetch_one(self, query, params=()):
         async with self.connection.execute(query, params) as cursor:
