@@ -19,6 +19,16 @@ class Database:
 
     async def _init_tables(self):
         await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        await self.connection.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -89,15 +99,31 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_guests_event ON guests (event_id)")
         await self.connection.commit()
 
-        # Safe migration: add error_detail column to existing databases.
+        # Safe migrations: add columns to existing databases.
         # SQLite raises OperationalError if the column already exists — silently ignore it.
-        try:
-            await self.connection.execute(
-                "ALTER TABLE photos ADD COLUMN error_detail TEXT"
-            )
-            await self.connection.commit()
-        except Exception:
-            pass  # Column already exists — nothing to do
+        # Events created before payments existed default to 'active' / 'not_required'.
+        for ddl in (
+            "ALTER TABLE photos ADD COLUMN error_detail TEXT",
+            "ALTER TABLE photos ADD COLUMN size_bytes INTEGER DEFAULT 0",
+            "ALTER TABLE events ADD COLUMN owner_id TEXT",
+            "ALTER TABLE events ADD COLUMN start_date TEXT",
+            "ALTER TABLE events ADD COLUMN end_date TEXT",
+            "ALTER TABLE events ADD COLUMN storage_capacity_gb REAL",
+            "ALTER TABLE events ADD COLUMN status TEXT DEFAULT 'active'",
+            "ALTER TABLE events ADD COLUMN amount_cents INTEGER DEFAULT 0",
+            "ALTER TABLE events ADD COLUMN payment_status TEXT DEFAULT 'not_required'",
+            "ALTER TABLE events ADD COLUMN payment_id TEXT",
+            "ALTER TABLE events ADD COLUMN paid_at TEXT",
+        ):
+            try:
+                await self.connection.execute(ddl)
+                await self.connection.commit()
+            except Exception:
+                pass  # Column already exists — nothing to do
+
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_owner ON events (owner_id)")
+        await self.connection.commit()
 
     async def fetch_one(self, query, params=()):
         async with self.connection.execute(query, params) as cursor:

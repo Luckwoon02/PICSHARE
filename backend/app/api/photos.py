@@ -4,11 +4,13 @@ import uuid
 import asyncio
 from typing import List
 from datetime import datetime
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Response
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Response, Depends
 from fastapi.responses import RedirectResponse, JSONResponse
 from PIL import Image
+from app.api.auth import get_current_user
 from app.core.config import get_settings
 from app.services.db import db
+from app.services.event_access import get_owned_event, get_owned_active_event
 from app.services.s3_service import s3_service
 from app.services.rekognition_service import rekognition_service
 from app.services.thumbnail_service import thumbnail_service
@@ -221,36 +223,55 @@ async def upload_photos(
     background_tasks: BackgroundTasks,
     event_id: str,
     files: List[UploadFile] = File(...),
+    user: dict = Depends(get_current_user),
 ):
-    row = await db.fetch_one("SELECT slug FROM events WHERE id = ?", (event_id,))
-    if not row:
-        raise HTTPException(status_code=404, detail="Event not found")
-    event_slug = row["slug"]
+    event = await get_owned_active_event(event_id, user)
+    event_slug = event["slug"]
 
-    processed_count = 0
+    # Stage every file first so the capacity check sees the real total size.
+    staged = []  # (photo_id, original_path, filename, size)
     for file in files:
         photo_id = str(uuid.uuid4())
         file_ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "jpg"
         original_path = os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{file_ext}")
-
         with open(original_path, "wb") as buf:
             shutil.copyfileobj(file.file, buf)
+        staged.append((photo_id, original_path, file.filename, os.path.getsize(original_path)))
 
+    capacity_gb = event.get("storage_capacity_gb")
+    if capacity_gb:  # legacy events without a capacity are unlimited
+        used = (await db.fetch_one(
+            "SELECT COALESCE(SUM(size_bytes), 0) AS used FROM photos WHERE event_id = ?",
+            (event_id,),
+        ))["used"]
+        incoming = sum(item[3] for item in staged)
+        capacity_bytes = int(capacity_gb * 1024 ** 3)
+        if used + incoming > capacity_bytes:
+            for _, path, _, _ in staged:
+                _remove_silently(path)
+            remaining_mb = max(capacity_bytes - used, 0) / (1024 * 1024)
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Not enough storage: {incoming / (1024 * 1024):.1f} MB selected, "
+                    f"{remaining_mb:.1f} MB left of {capacity_gb:g} GB."
+                ),
+            )
+
+    for photo_id, original_path, filename, size in staged:
         await db.execute(
             """
-            INSERT INTO photos (id, event_id, original_file_name, status, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO photos (id, event_id, original_file_name, size_bytes, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (photo_id, event_id, file.filename, "pending", datetime.utcnow().isoformat()),
+            (photo_id, event_id, filename, size, "pending", datetime.utcnow().isoformat()),
         )
-
         background_tasks.add_task(
-            process_photo, photo_id, event_id, event_slug, original_path, file.filename
+            process_photo, photo_id, event_id, event_slug, original_path, filename
         )
-        processed_count += 1
 
     return {
-        "message": f"Successfully started processing {processed_count} photos",
+        "message": f"Successfully started processing {len(staged)} photos",
         "event_id": event_id,
     }
 
@@ -272,11 +293,8 @@ async def start_sync(event_id: str):
 # ---------------------------------------------------------------------------
 
 @router.get("/status/{event_id}")
-async def get_event_status(event_id: str):
-    row = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
-    if not row:
-        raise HTTPException(status_code=404, detail="Event not found")
-    event = dict(row)
+async def get_event_status(event_id: str, user: dict = Depends(get_current_user)):
+    event = await get_owned_event(event_id, user)
 
     counts = await db.fetch_one(
         """
@@ -313,7 +331,10 @@ async def get_event_status(event_id: str):
 # ---------------------------------------------------------------------------
 
 @router.get("/event/{event_id}/gallery")
-async def get_event_photos(event_id: str, page: int = 1, limit: int = 100):
+async def get_event_photos(
+    event_id: str, page: int = 1, limit: int = 100, user: dict = Depends(get_current_user)
+):
+    await get_owned_event(event_id, user)
     offset = (page - 1) * limit
 
     count_result = await db.fetch_one(
@@ -377,12 +398,13 @@ async def get_event_photos(event_id: str, page: int = 1, limit: int = 100):
 # ---------------------------------------------------------------------------
 
 @router.get("/stuck/{event_id}")
-async def get_stuck_photos(event_id: str):
+async def get_stuck_photos(event_id: str, user: dict = Depends(get_current_user)):
     """
     Returns all photos for this event that are in an error or permanently
     pending state with no S3 key — i.e. will never be viewable.
     Use DELETE /photos/stuck/{event_id} to purge them.
     """
+    await get_owned_event(event_id, user)
     rows = await db.fetch_all(
         """
         SELECT id, original_file_name, status, error_detail, created_at
@@ -397,11 +419,12 @@ async def get_stuck_photos(event_id: str):
 
 
 @router.delete("/stuck/{event_id}")
-async def purge_stuck_photos(event_id: str):
+async def purge_stuck_photos(event_id: str, user: dict = Depends(get_current_user)):
     """
     Deletes all error/stuck photo rows for this event that have no S3 key.
     These are safe to remove — they were never successfully uploaded.
     """
+    await get_owned_event(event_id, user)
     rows = await db.fetch_all(
         """
         SELECT id FROM photos
@@ -433,8 +456,14 @@ async def purge_stuck_photos(event_id: str):
 # ---------------------------------------------------------------------------
 
 @router.delete("/delete/{photo_id}")
-async def delete_photo(photo_id: str):
-    photo = await db.fetch_one("SELECT * FROM photos WHERE id = ?", (photo_id,))
+async def delete_photo(photo_id: str, user: dict = Depends(get_current_user)):
+    photo = await db.fetch_one(
+        """
+        SELECT p.* FROM photos p JOIN events e ON e.id = p.event_id
+        WHERE p.id = ? AND e.owner_id = ?
+        """,
+        (photo_id, user["id"]),
+    )
     if not photo:
         raise HTTPException(status_code=404, detail="Photo not found")
 
@@ -462,13 +491,19 @@ async def delete_photo(photo_id: str):
 # ---------------------------------------------------------------------------
 
 @router.post("/delete/bulk")
-async def delete_photos_bulk(photo_ids: List[str]):
+async def delete_photos_bulk(photo_ids: List[str], user: dict = Depends(get_current_user)):
     deleted_count = 0
     errors = []
 
     for photo_id in photo_ids:
         try:
-            photo = await db.fetch_one("SELECT * FROM photos WHERE id = ?", (photo_id,))
+            photo = await db.fetch_one(
+                """
+                SELECT p.* FROM photos p JOIN events e ON e.id = p.event_id
+                WHERE p.id = ? AND e.owner_id = ?
+                """,
+                (photo_id, user["id"]),
+            )
             if not photo:
                 errors.append(f"Photo {photo_id} not found")
                 continue

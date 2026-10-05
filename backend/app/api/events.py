@@ -1,18 +1,23 @@
+import re
 import uuid
-import json
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
+from app.api.auth import get_current_user
+from app.core.config import get_settings
 from app.services.db import db
+from app.services.event_access import get_owned_event
+from app.services.payment_service import calculate_amount_cents
 from app.services.rekognition_service import rekognition_service
 
 router = APIRouter(prefix="/events", tags=["events"],)
 
 class EventCreate(BaseModel):
-    name: str
-    slug: str
-    date: datetime
+    name: str = Field(min_length=1, max_length=120)
+    start_date: datetime
+    end_date: datetime
+    storage_capacity_gb: float = Field(gt=0)
     secret_code: Optional[str] = None
 
 class EventResponse(BaseModel):
@@ -20,6 +25,12 @@ class EventResponse(BaseModel):
     name: str
     slug: str
     date: datetime
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    storage_capacity_gb: Optional[float] = None
+    status: str = "active"  # pending_payment, active
+    amount_cents: int = 0
+    payment_status: str = "not_required"  # pending, paid, skipped, not_required
     secret_code: Optional[str] = None
     created_at: datetime
     sync_status: str = "idle"  # idle, syncing, completed, error
@@ -33,6 +44,8 @@ class PublicEventResponse(BaseModel):
     name: str
     slug: str
     date: datetime
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
     is_protected: bool
     created_at: datetime
 
@@ -46,12 +59,9 @@ def format_event(row):
     d["_id"] = d.pop("id")
     
     # Handle ISO strings to datetime objects for Pydantic
-    if d.get("date"):
-        d["date"] = datetime.fromisoformat(d["date"])
-    if d.get("created_at"):
-        d["created_at"] = datetime.fromisoformat(d["created_at"])
-    if d.get("last_sync_at"):
-        d["last_sync_at"] = datetime.fromisoformat(d["last_sync_at"])
+    for key in ("date", "start_date", "end_date", "created_at", "last_sync_at"):
+        if d.get(key):
+            d[key] = datetime.fromisoformat(d[key])
     
     # Add protection flag
     d["is_protected"] = bool(d.get("secret_code"))
@@ -59,12 +69,12 @@ def format_event(row):
 
 @router.get("/public/list", response_model=List[PublicEventResponse])
 async def list_public_events():
-    rows = await db.fetch_all("SELECT * FROM events ORDER BY date DESC")
+    rows = await db.fetch_all("SELECT * FROM events WHERE status = 'active' ORDER BY date DESC")
     return [format_event(row) for row in rows]
 
 @router.get("/public/{slug}", response_model=PublicEventResponse)
 async def get_public_event(slug: str):
-    row = await db.fetch_one("SELECT * FROM events WHERE slug = ?", (slug,))
+    row = await db.fetch_one("SELECT * FROM events WHERE slug = ? AND status = 'active'", (slug,))
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
     return format_event(row)
@@ -75,7 +85,7 @@ class CodeVerify(BaseModel):
 
 @router.post("/verify")
 async def verify_event_code(data: CodeVerify):
-    row = await db.fetch_one("SELECT * FROM events WHERE slug = ?", (data.slug,))
+    row = await db.fetch_one("SELECT * FROM events WHERE slug = ? AND status = 'active'", (data.slug,))
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
     
@@ -85,97 +95,110 @@ async def verify_event_code(data: CodeVerify):
     
     return {"status": "success", "event": event}
 
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "event"
+
+async def _unique_slug(name: str) -> str:
+    base = _slugify(name)
+    while True:
+        slug = f"{base}-{uuid.uuid4().hex[:4]}"
+        if not await db.fetch_one("SELECT id FROM events WHERE slug = ?", (slug,)):
+            return slug
+
 @router.post("", response_model=EventResponse)
 @router.post("/", response_model=EventResponse)
-async def create_event(event: EventCreate):
-    # Check if slug exists
-    existing = await db.fetch_one("SELECT id FROM events WHERE slug = ?", (event.slug,))
-    if existing:
-        raise HTTPException(status_code=400, detail="Slug already exists")
-    
+async def create_event(event: EventCreate, user: dict = Depends(get_current_user)):
+    """
+    Create an event in `pending_payment` state. It becomes `active` (and gets its
+    Rekognition collection) once payment completes — see app/api/payments.py.
+    """
+    settings = get_settings()
+    if event.end_date < event.start_date:
+        raise HTTPException(status_code=422, detail="End date must be on or after the start date")
+    if not settings.MIN_STORAGE_GB <= event.storage_capacity_gb <= settings.MAX_STORAGE_GB:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Storage must be between {settings.MIN_STORAGE_GB:g} and {settings.MAX_STORAGE_GB:g} GB",
+        )
+
     event_id = str(uuid.uuid4())
+    slug = await _unique_slug(event.name)
     created_at = datetime.utcnow().isoformat()
-    
+
     await db.execute("""
-        INSERT INTO events (id, name, slug, date, secret_code, sync_status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO events (
+            id, name, slug, date, start_date, end_date, storage_capacity_gb,
+            secret_code, sync_status, created_at, owner_id,
+            status, amount_cents, payment_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         event_id,
-        event.name,
-        event.slug,
-        event.date.isoformat(),
-        event.secret_code,
+        event.name.strip(),
+        slug,
+        event.start_date.isoformat(),
+        event.start_date.isoformat(),
+        event.end_date.isoformat(),
+        event.storage_capacity_gb,
+        event.secret_code or None,
         "idle",
-        created_at
+        created_at,
+        user["id"],
+        "pending_payment",
+        calculate_amount_cents(event.storage_capacity_gb),
+        "pending",
     ))
-    
+
     row = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
-    # Create the Rekognition collection for this event (idempotent)
-    await rekognition_service.create_event_collection(event_id)
     return format_event(row)
 
 @router.get("", response_model=List[EventResponse])
 @router.get("/", response_model=List[EventResponse])
-async def list_events():
-    rows = await db.fetch_all("SELECT * FROM events ORDER BY created_at DESC")
+async def list_events(user: dict = Depends(get_current_user)):
+    rows = await db.fetch_all(
+        "SELECT * FROM events WHERE owner_id = ? ORDER BY created_at DESC", (user["id"],)
+    )
     return [format_event(row) for row in rows]
 
-@router.put("/{event_id}", response_model=EventResponse)
-async def update_event(event_id: str, event_data: dict):
-    # event_data comes as a dict from frontend
-    existing = await db.fetch_one("SELECT id FROM events WHERE id = ?", (event_id,))
-    if not existing:
-        raise HTTPException(status_code=404, detail="Event not found")
-    
-    if not event_data:
-        raise HTTPException(status_code=400, detail="No data to update")
+# Only these fields may be changed after creation. Capacity/dates are fixed because
+# the owner has already paid for them.
+UPDATABLE_FIELDS = {"name", "secret_code"}
 
-    # Build update query dynamically
-    fields = []
-    params = []
-    for key, value in event_data.items():
-        # Map frontend _id back to id if necessary, but usually we don't update ID
-        if key == "_id": continue 
-        
-        fields.append(f"{key} = ?")
-        if isinstance(value, datetime):
-            params.append(value.isoformat())
-        else:
-            params.append(value)
-    
-    params.append(event_id)
-    query = f"UPDATE events SET {', '.join(fields)} WHERE id = ?"
-    
-    await db.execute(query, params)
-    
+@router.put("/{event_id}", response_model=EventResponse)
+async def update_event(event_id: str, event_data: dict, user: dict = Depends(get_current_user)):
+    await get_owned_event(event_id, user)
+
+    updates = {k: v for k, v in event_data.items() if k in UPDATABLE_FIELDS}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updatable fields provided")
+
+    fields = ", ".join(f"{key} = ?" for key in updates)
+    await db.execute(
+        f"UPDATE events SET {fields} WHERE id = ?", [*updates.values(), event_id]
+    )
+
     updated = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
     return format_event(updated)
 
 @router.get("/{event_id}", response_model=EventResponse)
-async def get_event(event_id: str):
-    row = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
-    if not row:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return format_event(row)
+async def get_event(event_id: str, user: dict = Depends(get_current_user)):
+    return format_event(await get_owned_event(event_id, user))
 
 @router.get("/{event_id}/storage")
-async def get_event_storage(event_id: str):
-    """Return S3 storage usage for the event prefix."""
+async def get_event_storage(event_id: str, user: dict = Depends(get_current_user)):
+    """Storage usage vs. the capacity the owner purchased."""
     from app.services.s3_service import s3_service
 
-    event = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+    event = await get_owned_event(event_id, user)
 
-    # Count DB records for quick stats
     photo_count_row = await db.fetch_one(
-        "SELECT COUNT(*) as total FROM photos WHERE event_id = ?", (event_id,)
+        "SELECT COUNT(*) as total, COALESCE(SUM(size_bytes), 0) as used FROM photos WHERE event_id = ?",
+        (event_id,),
     )
     guest_count_row = await db.fetch_one(
         "SELECT COUNT(*) as total FROM guests WHERE event_id = ?", (event_id,)
     )
 
-    # Sum S3 object sizes under the event prefix
+    # Actual S3 footprint (originals + thumbnails + selfies)
     prefix = f"events/{event_id}/"
     try:
         event_storage, s3_object_count = await s3_service.get_prefix_size(prefix)
@@ -183,8 +206,12 @@ async def get_event_storage(event_id: str):
         print(f"[storage] S3 list error for {event_id}: {e}")
         event_storage, s3_object_count = 0, 0
 
+    capacity_bytes = int((event.get("storage_capacity_gb") or 0) * 1024 ** 3)
     return {
         "event_id": event_id,
+        # Capacity is enforced against the sum of uploaded original sizes.
+        "capacity_bytes": capacity_bytes,
+        "used_bytes": photo_count_row["used"],
         "event_storage_bytes": event_storage,
         "event_storage_mb": round(event_storage / (1024 * 1024), 2),
         "event_storage_gb": round(event_storage / (1024 * 1024 * 1024), 4),
@@ -194,7 +221,7 @@ async def get_event_storage(event_id: str):
     }
 
 @router.delete("/{event_id}")
-async def delete_event(event_id: str):
+async def delete_event(event_id: str, user: dict = Depends(get_current_user)):
     """Delete an event and all associated data — DB rows, local files, and S3 objects."""
     import os
     from app.core.config import get_settings
@@ -202,9 +229,7 @@ async def delete_event(event_id: str):
 
     settings = get_settings()
 
-    event = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+    await get_owned_event(event_id, user)
 
     try:
         photos = await db.fetch_all("SELECT * FROM photos WHERE event_id = ?", (event_id,))

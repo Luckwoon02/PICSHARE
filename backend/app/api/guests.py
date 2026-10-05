@@ -6,9 +6,11 @@ import json
 import io
 import zipfile
 from datetime import datetime
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Response
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Response, Depends
 from fastapi.responses import RedirectResponse
+from app.api.auth import get_current_user
 from app.services.db import db
+from app.services.event_access import get_owned_event
 from app.services.s3_service import s3_service
 from app.services.rekognition_service import rekognition_service
 from app.core.config import get_settings
@@ -132,14 +134,14 @@ def _remove_silently(path: str) -> None:
 async def guest_request(
     background_tasks: BackgroundTasks,
     event_slug: str = Form(...),
-    name: str = Form(...),
-    email: str = Form(...),
+    name: str = Form(None),
+    email: str = Form(None),
     phone: str = Form(None),
     secret_code: str = Form(None),
     selfie: UploadFile = File(...),
 ):
     row = await db.fetch_one(
-        "SELECT id, secret_code FROM events WHERE slug = ?", (event_slug,)
+        "SELECT id, secret_code FROM events WHERE slug = ? AND status = 'active'", (event_slug,)
     )
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -150,11 +152,13 @@ async def guest_request(
     if expected_code and expected_code != secret_code:
         raise HTTPException(status_code=401, detail="Invalid secret code")
 
-    # Return existing request if the same name+email already submitted
-    existing = await db.fetch_one(
-        "SELECT * FROM guests WHERE event_id = ? AND name = ? AND email = ?",
-        (event_id, name, email),
-    )
+    # Name/email are optional. When given, return the existing request for the same pair.
+    existing = None
+    if name and email:
+        existing = await db.fetch_one(
+            "SELECT * FROM guests WHERE event_id = ? AND name = ? AND email = ?",
+            (event_id, name, email),
+        )
     if existing:
         return {
             "message": "Found your existing request!",
@@ -163,6 +167,8 @@ async def guest_request(
         }
 
     request_id = str(uuid.uuid4())
+    name = name or f"Guest {request_id[:6]}"
+    email = email or ""
     file_ext = selfie.filename.rsplit(".", 1)[-1] if "." in selfie.filename else "jpg"
     selfie_path = os.path.join(settings.GUEST_SELFIES_DIR, f"{request_id}.{file_ext}")
 
@@ -207,7 +213,8 @@ async def get_guest_request_status(request_id: str):
 # ---------------------------------------------------------------------------
 
 @router.get("/event/{event_id}")
-async def get_event_guests(event_id: str):
+async def get_event_guests(event_id: str, user: dict = Depends(get_current_user)):
+    await get_owned_event(event_id, user)
     rows = await db.fetch_all(
         """
         SELECT id, name, email, phone, selfie_path, status, match_count, created_at
@@ -269,8 +276,14 @@ async def get_guest_selfie(guest_id: str):
 # ---------------------------------------------------------------------------
 
 @router.delete("/{guest_id}")
-async def delete_guest(guest_id: str):
-    row = await db.fetch_one("SELECT selfie_path FROM guests WHERE id = ?", (guest_id,))
+async def delete_guest(guest_id: str, user: dict = Depends(get_current_user)):
+    row = await db.fetch_one(
+        """
+        SELECT g.selfie_path FROM guests g JOIN events e ON e.id = g.event_id
+        WHERE g.id = ? AND e.owner_id = ?
+        """,
+        (guest_id, user["id"]),
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Guest not found")
 

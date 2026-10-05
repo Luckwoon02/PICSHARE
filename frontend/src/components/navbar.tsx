@@ -4,15 +4,15 @@ import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
-import { Moon, Sun, Laptop, Lock, Home, Calendar } from "lucide-react";
+import { Moon, Sun, Laptop, Home, Calendar, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import Cookies from "js-cookie";
+import { useAuth } from "@/lib/use-auth";
 
 export function Navbar() {
     const { theme, setTheme } = useTheme();
     const [mounted, setMounted] = useState(false);
     const pathname = usePathname();
-    const isAdminToken = Cookies.get("admin_token");
+    const { user, logout } = useAuth();
 
     useEffect(() => {
         const frame = requestAnimationFrame(() => {
@@ -20,9 +20,6 @@ export function Navbar() {
         });
         return () => cancelAnimationFrame(frame);
     }, []);
-
-    // Hide login button if logged in or already on admin dashboard
-    const showLoginButton = !isAdminToken && pathname !== "/admin/login" && !pathname.startsWith("/admin/dashboard");
 
     if (!mounted) {
         return (
@@ -53,37 +50,45 @@ export function Navbar() {
                 </div>
 
                 <div className="flex items-center gap-2 md:gap-4">
-                    <Link href="/events">
-                        <Button variant="ghost" className={`text-slate-600 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 text-sm font-medium gap-2 hidden sm:flex ${pathname === '/events' ? 'text-indigo-600 dark:text-indigo-400 bg-indigo-50/50 dark:bg-indigo-950/20' : ''}`}>
+                    <Link href={user ? "/dashboard" : "/login"}>
+                        <Button variant="ghost" className={`text-slate-600 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 text-sm font-medium gap-2 hidden sm:flex ${pathname.startsWith('/dashboard') ? 'text-indigo-600 dark:text-indigo-400 bg-indigo-50/50 dark:bg-indigo-950/20' : ''}`}>
                             <Calendar className="w-4 h-4" />
                             Events
                         </Button>
-                        <Button variant="ghost" size="icon" className={`h-9 w-9 rounded-full sm:hidden ${pathname === '/events' ? 'text-indigo-600 dark:text-indigo-400 bg-indigo-50/50 dark:bg-indigo-950/20' : ''}`} title="Browse Events">
+                        <Button variant="ghost" size="icon" className={`h-9 w-9 rounded-full sm:hidden ${pathname.startsWith('/dashboard') ? 'text-indigo-600 dark:text-indigo-400 bg-indigo-50/50 dark:bg-indigo-950/20' : ''}`} title="My Events">
                             <Calendar className="w-4 h-4" />
                         </Button>
                     </Link>
-                    {isAdminToken && !pathname.startsWith("/admin/dashboard") && (
-                        <Link href="/admin/dashboard">
-                            <Button variant="ghost" className="text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/30 text-sm font-bold gap-2 hidden sm:flex">
-                                <Laptop className="w-4 h-4" />
-                                Dashboard
+                    {user ? (
+                        <>
+                            <Button
+                                variant="ghost"
+                                onClick={logout}
+                                className="text-slate-600 dark:text-slate-400 hover:text-red-600 text-sm font-medium gap-2 hidden sm:flex"
+                                title={user.email}
+                            >
+                                <LogOut className="w-4 h-4" />
+                                Log out
                             </Button>
-                            <Button variant="ghost" size="icon" className="h-9 w-9 rounded-full sm:hidden text-indigo-600 dark:text-indigo-400" title="Admin Dashboard">
-                                <Laptop className="w-4 h-4" />
+                            <Button variant="ghost" size="icon" onClick={logout} className="h-9 w-9 rounded-full sm:hidden" title="Log out">
+                                <LogOut className="w-4 h-4" />
                             </Button>
-                        </Link>
-                    )}
-
-                    {showLoginButton && (
-                        <Link href="/admin/login">
-                            <Button variant="ghost" className="text-slate-600 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 text-sm font-medium gap-2 hidden sm:flex">
-                                <Lock className="w-4 h-4" />
-                                Admin Login
-                            </Button>
-                            <Button variant="ghost" size="icon" className="h-9 w-9 rounded-full sm:hidden" title="Admin Login">
-                                <Lock className="w-4 h-4" />
-                            </Button>
-                        </Link>
+                        </>
+                    ) : (
+                        pathname !== "/login" && pathname !== "/register" && (
+                            <>
+                                <Link href="/login">
+                                    <Button variant="ghost" className="text-slate-600 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 text-sm font-medium">
+                                        Log in
+                                    </Button>
+                                </Link>
+                                <Link href="/register">
+                                    <Button className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold">
+                                        Sign up
+                                    </Button>
+                                </Link>
+                            </>
+                        )
                     )}
 
                     <div className="flex items-center bg-slate-100 dark:bg-slate-800 rounded-full p-1 border border-slate-200 dark:border-slate-700 shadow-inner">

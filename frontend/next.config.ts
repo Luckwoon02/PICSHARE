@@ -8,6 +8,12 @@ const nextConfig: NextConfig = {
   reactCompiler: true,
   allowedDevOrigins: [],
 
+  // Old admin URLs → new account pages
+  redirects: async () => [
+    { source: "/admin/login", destination: "/login", permanent: true },
+    { source: "/admin/dashboard", destination: "/dashboard", permanent: true },
+  ],
+
   // Proxy /api/* → backend so the frontend never hard-codes the backend URL
   rewrites: async () => [
     {

@@ -3,7 +3,7 @@
 import React from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { Camera, Sparkles, ShieldCheck, Zap, ArrowRight, PartyPopper } from "lucide-react";
+import { Camera, Sparkles, ShieldCheck, Zap, ArrowRight, PartyPopper, CalendarPlus } from "lucide-react";
 
 export default function HomeClient() {
     const router = useRouter();
@@ -28,14 +28,22 @@ export default function HomeClient() {
                         No more hunting through thousands of event photos. Upload a selfie and our AI will find every moment you captured, delivered straight to your personal gallery.
                     </p>
 
-                    <div className="flex justify-center">
+                    <div className="flex flex-col sm:flex-row justify-center gap-4">
                         <Button
                             className="h-14 px-8 bg-indigo-600 hover:bg-indigo-700 text-white text-lg font-bold rounded-2xl shadow-xl shadow-indigo-200 dark:shadow-none transition-all hover:scale-105 active:scale-95 group"
+                            onClick={() => router.push('/register')}
+                        >
+                            <CalendarPlus className="mr-2 w-5 h-5" />
+                            Host an event
+                            <ArrowRight className="ml-2 w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                        </Button>
+                        <Button
+                            variant="outline"
+                            className="h-14 px-8 text-lg font-bold rounded-2xl transition-all hover:scale-105 active:scale-95 group"
                             onClick={() => router.push('/events')}
                         >
                             <PartyPopper className="mr-2 w-5 h-5 group-hover:rotate-12 transition-transform" />
-                            Browse All Active Events
-                            <ArrowRight className="ml-2 w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                            Find my photos
                         </Button>
                     </div>
                 </div>

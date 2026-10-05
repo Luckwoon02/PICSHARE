@@ -29,9 +29,8 @@ export default function GuestUploadClient() {
     const [secretCode, setSecretCode] = useState("");
     const [isVerified, setIsVerified] = useState(false);
     const [checkingEvent, setCheckingEvent] = useState(true);
-    const [savedGuests, setSavedGuests] = useState<{ id: string; name: string; email: string }[]>([]);
+    const [savedGuests, setSavedGuests] = useState<{ id: string; name: string; email?: string }[]>([]);
     const [showUploadForm, setShowUploadForm] = useState(false);
-    const [submittingGuest, setSubmittingGuest] = useState<{ name: string; email: string } | null>(null);
 
     useEffect(() => {
         if (typeof window !== "undefined" && window.location.protocol === "http:" && window.location.hostname !== "localhost") {
@@ -170,16 +169,14 @@ export default function GuestUploadClient() {
                             setLoading(false);
 
                             // Save to local storage
-                            if (submittingGuest) {
-                                const newGuest = { id: requestId, name: submittingGuest.name, email: submittingGuest.email };
-                                const currentSaved = JSON.parse(localStorage.getItem(`guests_${slug}`) || "[]");
+                            const currentSaved = JSON.parse(localStorage.getItem(`guests_${slug}`) || "[]");
 
-                                // Check if already exists
-                                if (!currentSaved.some((g: { id: string }) => g.id === requestId)) {
-                                    const updated = [...currentSaved, newGuest];
-                                    localStorage.setItem(`guests_${slug}`, JSON.stringify(updated));
-                                    setSavedGuests(updated);
-                                }
+                            // Check if already exists
+                            if (!currentSaved.some((g: { id: string }) => g.id === requestId)) {
+                                const newGuest = { id: requestId, name: `Face ${currentSaved.length + 1}` };
+                                const updated = [...currentSaved, newGuest];
+                                localStorage.setItem(`guests_${slug}`, JSON.stringify(updated));
+                                setSavedGuests(updated);
                             }
                         }
                         else if (data.status === "error") {
@@ -194,7 +191,7 @@ export default function GuestUploadClient() {
             }, 3000);
         }
         return () => clearInterval(interval);
-    }, [polling, requestId, submittingGuest, slug]);
+    }, [polling, requestId, slug]);
 
     const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault();
@@ -205,17 +202,8 @@ export default function GuestUploadClient() {
 
         setLoading(true);
         const formData = new FormData();
-        const form = e.currentTarget;
-        const nameInput = form.elements.namedItem("name") as HTMLInputElement;
-        const emailInput = form.elements.namedItem("email") as HTMLInputElement;
-
-        const name = nameInput.value;
-        const email = emailInput.value;
-        setSubmittingGuest({ name, email });
 
         formData.append("event_slug", slug);
-        formData.append("name", name);
-        formData.append("email", email);
         formData.append("selfie", file);
         if (secretCode) {
             formData.append("secret_code", secretCode);
@@ -415,7 +403,7 @@ export default function GuestUploadClient() {
                                         </div>
                                         <div className="flex-1 min-w-0">
                                             <p className="font-bold text-foreground truncate group-hover:text-indigo-600 transition-colors uppercase text-sm tracking-wide">{guest.name}</p>
-                                            <p className="text-xs text-muted-foreground truncate">{guest.email}</p>
+                                            {guest.email && <p className="text-xs text-muted-foreground truncate">{guest.email}</p>}
                                         </div>
                                         <ArrowRight className="w-5 h-5 text-muted-foreground group-hover:text-indigo-600 group-hover:translate-x-1 transition-all" />
                                     </a>
@@ -473,20 +461,9 @@ export default function GuestUploadClient() {
                 </CardHeader>
                 <form onSubmit={handleSubmit}>
                     <CardContent className="space-y-6">
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div className="space-y-2">
-                                <Label htmlFor="name">Full Name</Label>
-                                <Input id="name" name="name" placeholder="John Doe" required className="border-border bg-background focus-visible:ring-indigo-500" />
-                            </div>
-                            <div className="space-y-2">
-                                <Label htmlFor="email">Email Address</Label>
-                                <Input id="email" name="email" type="email" placeholder="john@example.com" required className="border-border bg-background focus-visible:ring-indigo-500" />
-                            </div>
-                        </div>
-
                         <div className="space-y-4">
                             <div className="flex items-center justify-between">
-                                <Label className="text-base font-semibold text-foreground">Step 2: Your Selfie</Label>
+                                <Label className="text-base font-semibold text-foreground">Your selfie</Label>
                                 <button
                                     type="button"
                                     onClick={() => {
