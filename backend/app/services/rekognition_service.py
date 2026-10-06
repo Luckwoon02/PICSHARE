@@ -4,6 +4,16 @@ from botocore.exceptions import ClientError
 from app.core.config import get_settings
 
 
+# Errors worth retrying: throttling and temporary AWS-side failures.
+TRANSIENT_ERROR_CODES = {
+    "ThrottlingException",
+    "ProvisionedThroughputExceededException",
+    "InternalServerError",
+    "ServiceUnavailableException",
+    "RequestTimeout",
+}
+
+
 class RekognitionService:
     def __init__(self):
         s = get_settings()
@@ -98,6 +108,8 @@ class RekognitionService:
             response = await asyncio.to_thread(_index)
         except ClientError as e:
             code = e.response["Error"]["Code"]
+            if code in TRANSIENT_ERROR_CODES:
+                raise  # let the caller retry
             print(f"[rekognition] index_faces error for {photo_id} ({code}): {e}")
             return []
 

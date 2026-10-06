@@ -135,6 +135,30 @@ export function formatDateRange(start?: string | null, end?: string | null): str
 // Upload with progress (fetch can't report upload progress)
 // ---------------------------------------------------------------------------
 
+/** Upload one file straight to S3 using a presigned POST. Reports bytes sent so far. */
+export function uploadToS3(
+    url: string,
+    fields: Record<string, string>,
+    file: File,
+    onProgress: (loadedBytes: number) => void
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const form = new FormData();
+        Object.entries(fields).forEach(([k, v]) => form.append(k, v));
+        form.append("file", file); // S3 requires the file to be the last field
+
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", url);
+        xhr.upload.onprogress = (e) => onProgress(e.loaded);
+        xhr.onerror = () => reject(new ApiError(0, "Upload failed — check your connection and try again."));
+        xhr.onload = () =>
+            xhr.status >= 200 && xhr.status < 300
+                ? resolve()
+                : reject(new ApiError(xhr.status, `Storage rejected ${file.name} (${xhr.status})`));
+        xhr.send(form);
+    });
+}
+
 export function uploadWithProgress<T = unknown>(
     path: string,
     form: FormData,

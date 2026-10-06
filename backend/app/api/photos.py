@@ -1,278 +1,215 @@
 import os
-import shutil
 import uuid
-import asyncio
 from typing import List
-from datetime import datetime
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Response, Depends
+from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Response, Depends
 from fastapi.responses import RedirectResponse, JSONResponse
-from PIL import Image
 from app.api.auth import get_current_user
 from app.core.config import get_settings
+from app.services import photo_worker
 from app.services.db import db
 from app.services.event_access import get_owned_event, get_owned_active_event
+from app.services.photo_worker import s3_original_key, remove_silently as _remove_silently
 from app.services.s3_service import s3_service
-from app.services.rekognition_service import rekognition_service
-from app.services.thumbnail_service import thumbnail_service
 
 router = APIRouter(prefix="/photos", tags=["photos"])
 settings = get_settings()
 
-# Local staging dirs (originals live here briefly before S3 upload)
-os.makedirs(settings.UPLOAD_ROOT, exist_ok=True)
-os.makedirs(settings.THUMBNAIL_ROOT, exist_ok=True)
+# Uploads go browser -> S3 directly. The routes below only register a photo and
+# queue it; photo_worker does the processing (and survives restarts).
 
 
 # ---------------------------------------------------------------------------
-# S3 key helpers
+# Direct-to-S3 upload: browser uploads straight to S3, server only signs + processes
 # ---------------------------------------------------------------------------
 
-def s3_original_key(event_id: str, photo_id: str, ext: str) -> str:
-    return f"events/{event_id}/originals/{photo_id}.{ext}"
-
-def s3_thumbnail_key(event_id: str, photo_id: str) -> str:
-    return f"events/{event_id}/thumbnails/{photo_id}.jpg"
+STALE_UPLOAD_AFTER = timedelta(hours=1)  # a pending_upload older than this was abandoned
+_IMAGE_EXTS = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
 
 
-# ---------------------------------------------------------------------------
-# Background processing — granular error reporting per step
-# ---------------------------------------------------------------------------
+def _stale_cutoff() -> str:
+    return (datetime.utcnow() - STALE_UPLOAD_AFTER).isoformat()
 
-async def process_photo(
-    photo_id: str,
-    event_id: str,
-    event_slug: str,
-    original_path: str,
-    filename: str,
-):
-    """
-    Full processing pipeline:
-    1. Read image dimensions.
-    2. Upload original to S3.
-    3. Generate thumbnail locally, upload to S3.
-    4. Index faces with Rekognition (against the event collection).
-    5. Store face rows in the faces table.
-    6. Update photos row to status=processed.
-    7. Remove local staging files.
-    """
 
-    def _mark_error(reason: str):
-        """Fire-and-forget DB update — called from except blocks."""
-        import asyncio as _asyncio
-        async def _update():
-            await db.execute(
-                "UPDATE photos SET status = ?, error_detail = ? WHERE id = ?",
-                ("error", reason[:500], photo_id),
-            )
-        try:
-            loop = _asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(_update())
-        except Exception:
-            pass  # best-effort
-
-    # ── Step 0: verify staging file exists ──────────────────────────────────
-    if not os.path.exists(original_path):
-        msg = f"[process_photo] Staging file missing for {photo_id}: {original_path}"
-        print(msg)
-        await db.execute(
-            "UPDATE photos SET status = ?, error_detail = ? WHERE id = ?",
-            ("error", "Staging file missing", photo_id),
-        )
+async def _check_capacity(event: dict, incoming: int) -> None:
+    """Raise 413 if `incoming` bytes won't fit in the event's storage capacity."""
+    capacity_gb = event.get("storage_capacity_gb")
+    if not capacity_gb:  # legacy events without a capacity are unlimited
         return
-
-    try:
-        file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "jpg"
-
-        # ── Step 1: image dimensions ─────────────────────────────────────────
-        try:
-            def get_image_size(path: str):
-                with Image.open(path) as img:
-                    return img.size
-            width, height = await asyncio.to_thread(get_image_size, original_path)
-            print(f"[process_photo] {photo_id} | dimensions: {width}x{height}")
-        except Exception as e:
-            print(f"[process_photo] STEP 1 FAILED — image read error for {photo_id}: {e}")
-            await db.execute(
-                "UPDATE photos SET status = ?, error_detail = ? WHERE id = ?",
-                ("error", f"Image read failed: {type(e).__name__}: {e}"[:500], photo_id),
-            )
-            _remove_silently(original_path)
-            return
-
-        # ── Step 2: upload original to S3 ────────────────────────────────────
-        s3_key = s3_original_key(event_id, photo_id, file_ext)
-        try:
-            content_type = _content_type(file_ext)
-            await s3_service.upload_file(original_path, s3_key, content_type)
-            print(f"[process_photo] {photo_id} | S3 original uploaded: {s3_key}")
-        except Exception as e:
-            msg = f"S3 upload failed: {type(e).__name__}: {e}"
-            print(f"[process_photo] STEP 2 FAILED — {msg}")
-            await db.execute(
-                "UPDATE photos SET status = ?, error_detail = ? WHERE id = ?",
-                ("error", msg[:500], photo_id),
-            )
-            _remove_silently(original_path)
-            return
-
-        # ── Step 3: generate thumbnail and upload to S3 ──────────────────────
-        thumb_local = os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg")
-        thumb_s3_key = s3_thumbnail_key(event_id, photo_id)
-        try:
-            await asyncio.to_thread(
-                thumbnail_service.generate_thumbnail, original_path, thumb_local
-            )
-            await s3_service.upload_file(thumb_local, thumb_s3_key, "image/jpeg")
-            print(f"[process_photo] {photo_id} | S3 thumbnail uploaded: {thumb_s3_key}")
-        except Exception as e:
-            print(f"[process_photo] STEP 3 FAILED — thumbnail for {photo_id}: {type(e).__name__}: {e}")
-            # Still continue — we have the original; thumbnail failure is non-fatal
-            thumb_s3_key = None
-
-        # ── Step 4: Rekognition face indexing ────────────────────────────────
-        try:
-            faces_data = await rekognition_service.index_photo_faces(
-                s3_key, photo_id, event_id
-            )
-            print(f"[process_photo] {photo_id} | Rekognition indexed {len(faces_data)} face(s)")
-        except Exception as e:
-            msg = f"Rekognition failed: {type(e).__name__}: {e}"
-            print(f"[process_photo] STEP 4 FAILED — {msg}")
-            faces_data = []
-            # store a warning but don't fail the photo — original is already on S3
-            await db.execute(
-                "UPDATE photos SET error_detail = ? WHERE id = ?",
-                (msg[:500], photo_id),
-            )
-
-        # ── Step 5: persist face rows ────────────────────────────────────────
-        now = datetime.utcnow().isoformat()
-        for face in faces_data:
-            try:
-                face_id = str(uuid.uuid4())
-                await db.execute(
-                    """
-                    INSERT INTO faces (id, photo_id, event_id, rekognition_face_id, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (face_id, photo_id, event_id, face["rekognition_face_id"], now),
-                )
-            except Exception as e:
-                print(f"[process_photo] STEP 5 FAILED — face insert for {photo_id}: {e}")
-
-        # ── Step 6: mark photo as processed ─────────────────────────────────
-        await db.execute(
-            """
-            UPDATE photos SET
-                s3_object_key    = ?,
-                thumbnail_s3_key = ?,
-                width            = ?,
-                height           = ?,
-                faces_count      = ?,
-                status           = ?
-            WHERE id = ?
-            """,
-            (s3_key, thumb_s3_key, width, height, len(faces_data), "processed", photo_id),
-        )
-
-        # ── Step 7: clean up local staging files ────────────────────────────
-        _remove_silently(original_path)
-        if thumb_s3_key:
-            _remove_silently(thumb_local)
-
-        print(
-            f"[process_photo] ✓ Done: {photo_id} | "
-            f"{len(faces_data)} face(s) | {width}x{height}"
-        )
-
-    except Exception as e:
-        # Catch-all safety net — should rarely be reached with per-step handling above
-        msg = f"Unexpected error: {type(e).__name__}: {e}"
-        print(f"[process_photo] UNEXPECTED ERROR for {photo_id}: {msg}")
-        await db.execute(
-            "UPDATE photos SET status = ?, error_detail = ? WHERE id = ?",
-            ("error", msg[:500], photo_id),
+    used = (await db.fetch_one(
+        """
+        SELECT COALESCE(SUM(size_bytes), 0) AS used FROM photos
+        WHERE event_id = ? AND NOT (status = 'pending_upload' AND created_at < ?)
+        """,
+        (event["id"], _stale_cutoff()),
+    ))["used"]
+    capacity_bytes = int(capacity_gb * 1024 ** 3)
+    if used + incoming > capacity_bytes:
+        remaining_mb = max(capacity_bytes - used, 0) / (1024 * 1024)
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Not enough storage: {incoming / (1024 * 1024):.1f} MB selected, "
+                f"{remaining_mb:.1f} MB left of {capacity_gb:g} GB."
+            ),
         )
 
 
-def _content_type(ext: str) -> str:
-    return {
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "webp": "image/webp",
-        "gif": "image/gif",
-    }.get(ext.lower(), "image/jpeg")
+class UploadFileSpec(BaseModel):
+    name: str
+    size: int = Field(gt=0)
+    content_type: str
 
 
-def _remove_silently(path: str) -> None:
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except Exception as e:
-        print(f"[cleanup] Could not remove {path}: {e}")
+class UploadUrlsRequest(BaseModel):
+    files: List[UploadFileSpec] = Field(min_length=1, max_length=500)
 
 
-# ---------------------------------------------------------------------------
-# Upload endpoint
-# ---------------------------------------------------------------------------
+class UploadCompleteRequest(BaseModel):
+    uploaded: List[str] = []
+    failed: List[str] = []
 
-@router.post("/upload")
-async def upload_photos(
-    background_tasks: BackgroundTasks,
+
+@router.post("/upload-urls")
+async def create_upload_urls(
     event_id: str,
-    files: List[UploadFile] = File(...),
+    body: UploadUrlsRequest,
     user: dict = Depends(get_current_user),
 ):
+    """Reserve a photo row per file and return a presigned S3 POST for each."""
     event = await get_owned_active_event(event_id, user)
-    event_slug = event["slug"]
 
-    # Stage every file first so the capacity check sees the real total size.
-    staged = []  # (photo_id, original_path, filename, size)
-    for file in files:
+    for f in body.files:
+        if f.content_type not in _IMAGE_EXTS:
+            raise HTTPException(status_code=400, detail=f"{f.name}: only JPG, PNG or WEBP images can be uploaded")
+    await _check_capacity(event, sum(f.size for f in body.files))
+
+    uploads = []
+    for f in body.files:
         photo_id = str(uuid.uuid4())
-        file_ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "jpg"
-        original_path = os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{file_ext}")
-        with open(original_path, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
-        staged.append((photo_id, original_path, file.filename, os.path.getsize(original_path)))
-
-    capacity_gb = event.get("storage_capacity_gb")
-    if capacity_gb:  # legacy events without a capacity are unlimited
-        used = (await db.fetch_one(
-            "SELECT COALESCE(SUM(size_bytes), 0) AS used FROM photos WHERE event_id = ?",
-            (event_id,),
-        ))["used"]
-        incoming = sum(item[3] for item in staged)
-        capacity_bytes = int(capacity_gb * 1024 ** 3)
-        if used + incoming > capacity_bytes:
-            for _, path, _, _ in staged:
-                _remove_silently(path)
-            remaining_mb = max(capacity_bytes - used, 0) / (1024 * 1024)
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"Not enough storage: {incoming / (1024 * 1024):.1f} MB selected, "
-                    f"{remaining_mb:.1f} MB left of {capacity_gb:g} GB."
-                ),
-            )
-
-    for photo_id, original_path, filename, size in staged:
+        key = s3_original_key(event_id, photo_id, _IMAGE_EXTS[f.content_type])
+        presigned = await s3_service.create_presigned_upload(key, f.content_type, f.size)
         await db.execute(
             """
             INSERT INTO photos (id, event_id, original_file_name, size_bytes, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (photo_id, event_id, filename, size, "pending", datetime.utcnow().isoformat()),
+            (photo_id, event_id, f.name, f.size, "pending_upload", datetime.utcnow().isoformat()),
         )
-        background_tasks.add_task(
-            process_photo, photo_id, event_id, event_slug, original_path, filename
+        uploads.append({"photo_id": photo_id, "url": presigned["url"], "fields": presigned["fields"]})
+    return {"uploads": uploads}
+
+
+@router.post("/upload-complete")
+async def complete_uploads(
+    event_id: str,
+    body: UploadCompleteRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Browser reports which direct uploads finished; start processing those."""
+    await get_owned_active_event(event_id, user)
+
+    async def _own_pending(ids: List[str]) -> list[dict]:
+        rows = []
+        for photo_id in ids:
+            row = await db.fetch_one(
+                """
+                SELECT id, event_id, original_file_name, thumbnail_s3_key FROM photos
+                WHERE id = ? AND event_id = ? AND status = 'pending_upload'
+                """,
+                (photo_id, event_id),
+            )
+            if row:
+                rows.append(dict(row))
+        return rows
+
+    for photo in await _own_pending(body.failed):
+        await db.execute("DELETE FROM photos WHERE id = ?", (photo["id"],))
+
+    queued, missing = 0, 0
+    for photo in await _own_pending(body.uploaded):
+        # The key's extension came from the content type at signing time, which usually
+        # matches the filename; try that first, then the other allowed extensions.
+        ext = os.path.splitext(photo["original_file_name"] or "")[1].lstrip(".").lower()
+        guess = "jpg" if ext == "jpeg" else ext
+        key = size = None
+        for candidate in dict.fromkeys([guess, *_IMAGE_EXTS.values()]):
+            if candidate not in _IMAGE_EXTS.values():
+                continue
+            k = s3_original_key(event_id, photo["id"], candidate)
+            size = await s3_service.get_object_size(k)
+            if size is not None:
+                key = k
+                break
+        if key is None:
+            missing += 1
+            await db.execute("DELETE FROM photos WHERE id = ?", (photo["id"],))
+            continue
+        # Queue it: the worker picks up status='pending' rows that have an S3 key.
+        await db.execute(
+            "UPDATE photos SET status = 'pending', s3_object_key = ?, size_bytes = ? WHERE id = ?",
+            (key, size, photo["id"]),
         )
+        queued += 1
+
+    if queued:
+        photo_worker.notify()
+    return {"processing": queued, "missing": missing}
+
+
+@router.post("/retry/{event_id}")
+async def retry_failed_photos(
+    event_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Re-run processing for failed photos (status=error) and for photos whose
+    face scan failed (processed with a warning). Needs the original in S3;
+    photos that never reached S3 must be re-uploaded.
+    """
+    await get_owned_active_event(event_id, user)
+    rows = await db.fetch_all(
+        """
+        SELECT id, event_id, original_file_name, s3_object_key, thumbnail_s3_key
+        FROM photos
+        WHERE event_id = ?
+          AND (status = 'error' OR (status = 'processed' AND error_detail IS NOT NULL))
+        """,
+        (event_id,),
+    )
+
+    retrying, needs_reupload = 0, 0
+    for row in rows:
+        photo = dict(row)
+        ext = os.path.splitext(photo["original_file_name"] or "")[1].lstrip(".").lower() or "jpg"
+        s3_key = photo["s3_object_key"] or s3_original_key(event_id, photo["id"], ext)
+        try:
+            exists = await s3_service.object_exists(s3_key)
+        except Exception:
+            exists = False
+        if not exists:
+            needs_reupload += 1
+            continue
+        # Back in the queue with a fresh set of attempts.
+        await db.execute(
+            """
+            UPDATE photos SET status = 'pending', s3_object_key = ?, error_detail = NULL,
+                attempts = 0, claimed_at = NULL, next_attempt_at = NULL
+            WHERE id = ?
+            """,
+            (s3_key, photo["id"]),
+        )
+        retrying += 1
+
+    if retrying:
+        photo_worker.notify()
 
     return {
-        "message": f"Successfully started processing {len(staged)} photos",
-        "event_id": event_id,
+        "retrying": retrying,
+        "needs_reupload": needs_reupload,
+        "message": f"Retrying {retrying} photo(s)"
+        + (f"; {needs_reupload} must be re-uploaded" if needs_reupload else ""),
     }
 
 
@@ -284,7 +221,7 @@ async def upload_photos(
 async def start_sync(event_id: str):
     return Response(
         status_code=410,
-        content=b"Drive sync removed. Upload photos directly via POST /photos/upload.",
+        content=b"Drive sync removed. Upload photos from the dashboard (POST /photos/upload-urls).",
     )
 
 
@@ -301,13 +238,13 @@ async def get_event_status(event_id: str, user: dict = Depends(get_current_user)
         SELECT
             COUNT(*)                                        AS total,
             SUM(status = 'pending')                        AS pending,
-            SUM(status = 'pending_upload')                 AS pending_upload,
+            SUM(status = 'pending_upload' AND created_at >= ?) AS pending_upload,
             SUM(status = 'processed')                      AS processed,
             SUM(status = 'error')                          AS errors,
             COALESCE(SUM(faces_count), 0)                  AS total_faces
         FROM photos WHERE event_id = ?
         """,
-        (event_id,),
+        (_stale_cutoff(), event_id),
     )
 
     total = counts["total"] or 0
@@ -410,10 +347,11 @@ async def get_stuck_photos(event_id: str, user: dict = Depends(get_current_user)
         SELECT id, original_file_name, status, error_detail, created_at
         FROM photos
         WHERE event_id = ?
-          AND (status = 'error' OR (status = 'pending' AND s3_object_key IS NULL))
+          AND (status = 'error' OR (status = 'pending' AND s3_object_key IS NULL)
+               OR (status = 'pending_upload' AND created_at < ?))
         ORDER BY created_at DESC
         """,
-        (event_id,),
+        (event_id, _stale_cutoff()),
     )
     return {"stuck_count": len(rows), "photos": [dict(r) for r in rows]}
 
@@ -427,11 +365,12 @@ async def purge_stuck_photos(event_id: str, user: dict = Depends(get_current_use
     await get_owned_event(event_id, user)
     rows = await db.fetch_all(
         """
-        SELECT id FROM photos
+        SELECT id, s3_object_key, thumbnail_s3_key FROM photos
         WHERE event_id = ?
-          AND (status = 'error' OR (status = 'pending' AND s3_object_key IS NULL))
+          AND (status = 'error' OR (status = 'pending' AND s3_object_key IS NULL)
+               OR (status = 'pending_upload' AND created_at < ?))
         """,
-        (event_id,),
+        (event_id, _stale_cutoff()),
     )
     if not rows:
         return {"message": "No stuck photos found", "deleted_count": 0}
@@ -439,6 +378,12 @@ async def purge_stuck_photos(event_id: str, user: dict = Depends(get_current_use
     deleted = 0
     for row in rows:
         photo_id = row["id"]
+        for key in (row["s3_object_key"], row["thumbnail_s3_key"]):
+            if key:
+                try:
+                    await s3_service.delete_object(key)
+                except Exception as e:
+                    print(f"[purge_stuck] could not delete {key}: {type(e).__name__}: {e}")
         # Clean up any leftover local staging files
         for ext in ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG", "webp", "WEBP"]:
             _remove_silently(os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}"))

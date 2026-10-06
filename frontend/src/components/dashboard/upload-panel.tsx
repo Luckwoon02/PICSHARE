@@ -4,7 +4,17 @@ import React, { useRef, useState } from "react";
 import { ImageIcon, Loader2, UploadCloud, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { formatBytes, uploadWithProgress } from "@/lib/api";
+import { api, formatBytes, uploadToS3 } from "@/lib/api";
+
+const PARALLEL_UPLOADS = 6; // photos sent to S3 at once
+const COMPLETE_BATCH = 25; // tell the server about finished uploads in groups
+const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp"];
+
+interface SignedUpload {
+    photo_id: string;
+    url: string;
+    fields: Record<string, string>;
+}
 
 export function UploadPanel({
     eventId,
@@ -26,8 +36,8 @@ export function UploadPanel({
     const uploading = progress !== null;
 
     const addFiles = (list: FileList | File[]) => {
-        const images = Array.from(list).filter((f) => f.type.startsWith("image/"));
-        if (images.length < Array.from(list).length) toast.error("Only image files can be uploaded");
+        const images = Array.from(list).filter((f) => ALLOWED_TYPES.includes(f.type));
+        if (images.length < Array.from(list).length) toast.error("Only JPG, PNG or WEBP images can be uploaded");
         // De-dupe by name+size so re-dropping the same batch doesn't double up
         setFiles((prev) => {
             const seen = new Set(prev.map((f) => `${f.name}:${f.size}`));
@@ -36,20 +46,83 @@ export function UploadPanel({
     };
 
     const upload = async () => {
-        const form = new FormData();
-        files.forEach((f) => form.append("files", f));
         setProgress(0);
+        const failed: File[] = [];
+        let succeeded = 0;
         try {
-            await uploadWithProgress(`/photos/upload?event_id=${eventId}`, form, setProgress);
-            toast.success(`Uploaded ${files.length} photo${files.length === 1 ? "" : "s"} — processing faces now`);
-            setFiles([]);
-            if (inputRef.current) inputRef.current.value = "";
-            onUploaded();
+            // 1. Ask the server for a signed S3 link per photo (also reserves storage)
+            const { uploads } = await api<{ uploads: SignedUpload[] }>(`/photos/upload-urls?event_id=${eventId}`, {
+                method: "POST",
+                body: JSON.stringify({
+                    files: files.map((f) => ({ name: f.name, size: f.size, content_type: f.type })),
+                }),
+            });
+
+            // 2. Send photos straight to S3, a few at a time
+            const sent = new Array(files.length).fill(0);
+            const report = () => setProgress(sent.reduce((a, b) => a + b, 0) / Math.max(totalBytes, 1));
+            let flushing: Promise<void> = Promise.resolve();
+            const doneIds: string[] = [];
+            const failedIds: string[] = [];
+
+            // 3. Tell the server which uploads finished so it can start processing them
+            const flush = (force = false) => {
+                if (!force && doneIds.length < COMPLETE_BATCH) return;
+                const body = { uploaded: doneIds.splice(0), failed: failedIds.splice(0) };
+                if (body.uploaded.length === 0 && body.failed.length === 0) return;
+                flushing = flushing.then(() =>
+                    api(`/photos/upload-complete?event_id=${eventId}`, { method: "POST", body: JSON.stringify(body) })
+                        .then(() => undefined)
+                        .catch((err) => {
+                            toast.error(err instanceof Error ? err.message : "Couldn't start processing");
+                        })
+                );
+            };
+
+            let next = 0;
+            const worker = async () => {
+                while (next < files.length) {
+                    const i = next++;
+                    const { url, fields, photo_id } = uploads[i];
+                    let ok = false;
+                    for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+                        try {
+                            await uploadToS3(url, fields, files[i], (loaded) => {
+                                sent[i] = loaded;
+                                report();
+                            });
+                            ok = true;
+                        } catch {
+                            sent[i] = 0;
+                        }
+                    }
+                    if (ok) {
+                        sent[i] = files[i].size;
+                        succeeded++;
+                        doneIds.push(photo_id);
+                    } else {
+                        failed.push(files[i]);
+                        failedIds.push(photo_id);
+                    }
+                    report();
+                    flush();
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(PARALLEL_UPLOADS, files.length) }, worker));
+            flush(true);
+            await flushing;
         } catch (err) {
             toast.error(err instanceof Error ? err.message : "Upload failed");
+            return;
         } finally {
             setProgress(null);
         }
+
+        if (succeeded > 0) toast.success(`Uploaded ${succeeded} photo${succeeded === 1 ? "" : "s"} — processing faces now`);
+        if (failed.length > 0) toast.error(`${failed.length} photo${failed.length === 1 ? "" : "s"} failed to upload — press Upload to try again`);
+        setFiles(failed);
+        if (inputRef.current) inputRef.current.value = "";
+        onUploaded();
     };
 
     return (

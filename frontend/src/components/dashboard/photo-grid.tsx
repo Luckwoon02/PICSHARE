@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { Check, ImageIcon, Loader2, Trash2, X } from "lucide-react";
+import { Check, ImageIcon, Loader2, RefreshCw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
@@ -17,16 +17,42 @@ export interface Photo {
 }
 
 export function PhotoGrid({
+    eventId,
     photos,
     loading,
     onChanged,
 }: {
+    eventId: string;
     photos: Photo[];
     loading: boolean;
     onChanged: () => void;
 }) {
     const [selected, setSelected] = useState<Set<string>>(new Set());
     const [deleting, setDeleting] = useState(false);
+    const [retrying, setRetrying] = useState(false);
+
+    // Failed outright, or processed but the face scan failed
+    const failedCount = photos.filter(
+        (p) => p.status === "error" || (p.status === "processed" && p.error_detail)
+    ).length;
+
+    const retryFailed = async () => {
+        setRetrying(true);
+        try {
+            const res = await api<{ retrying: number; needs_reupload: number; message: string }>(
+                `/photos/retry/${eventId}`,
+                { method: "POST" }
+            );
+            if (res.retrying > 0) toast.success(res.message);
+            else toast.error(res.needs_reupload > 0 ? "These photos never reached storage — please upload them again" : "Nothing to retry");
+            if (res.retrying > 0 && res.needs_reupload > 0) toast.info(`${res.needs_reupload} photo(s) must be re-uploaded`);
+            onChanged();
+        } catch (err) {
+            toast.error(err instanceof Error ? err.message : "Couldn't retry photos");
+        } finally {
+            setRetrying(false);
+        }
+    };
 
     const toggle = (id: string) =>
         setSelected((prev) => {
@@ -86,12 +112,20 @@ export function PhotoGrid({
                     />
                     {selected.size > 0 ? `${selected.size} selected` : `Select all (${photos.length})`}
                 </label>
-                {selected.size > 0 && (
-                    <Button variant="destructive" size="sm" onClick={deleteSelected} disabled={deleting}>
-                        {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
-                        Delete selected
-                    </Button>
-                )}
+                <div className="flex items-center gap-2">
+                    {failedCount > 0 && (
+                        <Button variant="outline" size="sm" onClick={retryFailed} disabled={retrying}>
+                            {retrying ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                            Retry {failedCount} failed
+                        </Button>
+                    )}
+                    {selected.size > 0 && (
+                        <Button variant="destructive" size="sm" onClick={deleteSelected} disabled={deleting}>
+                            {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                            Delete selected
+                        </Button>
+                    )}
+                </div>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">

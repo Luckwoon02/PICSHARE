@@ -14,8 +14,8 @@ async def run_recovery_tasks():
     """
     1. Reset events stuck in 'syncing' status back to 'idle'.
        (sync_status is repurposed for tracking bulk-upload progress.)
-    2. Log any photos still in 'pending' or 'pending_upload' status so
-       operators can decide whether to re-upload them.
+    2. Log any photos still in 'pending' or 'pending_upload' status. Pending photos
+       are processed by the API's photo worker; this is informational only.
     """
     logging.info("Checking for interrupted uploads...")
 
@@ -45,7 +45,7 @@ async def run_recovery_tasks():
     if pending_photos:
         logging.warning(
             f"Found {len(pending_photos)} photo(s) in pending state. "
-            "Re-upload via POST /photos/upload to reprocess."
+            "The API's photo worker picks these up automatically."
         )
         by_event: dict[str, int] = defaultdict(int)
         for photo in pending_photos:

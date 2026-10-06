@@ -1,5 +1,6 @@
 import asyncio
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from app.core.config import get_settings
 
@@ -12,6 +13,9 @@ class S3Service:
             region_name=s.AWS_REGION,
             aws_access_key_id=s.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=s.AWS_SECRET_ACCESS_KEY,
+            # Regional endpoint so browser uploads aren't redirected (a redirect breaks CORS POSTs)
+            endpoint_url=f"https://s3.{s.AWS_REGION}.amazonaws.com",
+            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
         )
         self.bucket = s.S3_BUCKET_NAME
 
@@ -48,6 +52,63 @@ class S3Service:
 
         await asyncio.to_thread(_upload)
         return s3_key
+
+    async def create_presigned_upload(
+        self,
+        s3_key: str,
+        content_type: str,
+        max_bytes: int,
+        expiry_seconds: int = 3600,
+    ) -> dict:
+        """
+        Presigned POST so the browser can upload straight to S3.
+        Returns {"url": ..., "fields": {...}}. S3 itself rejects the upload if the
+        file is larger than max_bytes or the Content-Type differs.
+        """
+        def _generate():
+            return self._client.generate_presigned_post(
+                Bucket=self.bucket,
+                Key=s3_key,
+                Fields={"Content-Type": content_type},
+                Conditions=[
+                    {"Content-Type": content_type},
+                    ["content-length-range", 1, max_bytes],
+                ],
+                ExpiresIn=expiry_seconds,
+            )
+
+        return await asyncio.to_thread(_generate)
+
+    async def get_object_size(self, s3_key: str) -> int | None:
+        """Size in bytes of the object, or None if it doesn't exist."""
+        def _head():
+            try:
+                return self._client.head_object(Bucket=self.bucket, Key=s3_key)["ContentLength"]
+            except ClientError as e:
+                if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+                    return None
+                raise
+
+        return await asyncio.to_thread(_head)
+
+    async def object_exists(self, s3_key: str) -> bool:
+        """True if the key exists in the bucket."""
+        def _head():
+            try:
+                self._client.head_object(Bucket=self.bucket, Key=s3_key)
+                return True
+            except ClientError as e:
+                if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+                    return False
+                raise
+
+        return await asyncio.to_thread(_head)
+
+    async def download_file(self, s3_key: str, local_path: str) -> None:
+        """Download an S3 object to a local path."""
+        await asyncio.to_thread(
+            self._client.download_file, self.bucket, s3_key, local_path
+        )
 
     # ------------------------------------------------------------------
     # Presigned URL

@@ -247,7 +247,7 @@ export default function EventDetailClient() {
                 {tab === "photos" ? (
                     <div className="space-y-6">
                         <UploadPanel eventId={id} remainingBytes={remaining} onUploaded={refreshAfterChange} />
-                        <PhotoGrid photos={photos} loading={loadingPhotos} onChanged={refreshAfterChange} />
+                        <PhotoGrid eventId={id} photos={photos} loading={loadingPhotos} onChanged={refreshAfterChange} />
                     </div>
                 ) : (
                     <GuestsTable guests={guests} loading={loadingGuests} onChanged={loadGuests} />

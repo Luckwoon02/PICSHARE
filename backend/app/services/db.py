@@ -105,6 +105,9 @@ class Database:
         for ddl in (
             "ALTER TABLE photos ADD COLUMN error_detail TEXT",
             "ALTER TABLE photos ADD COLUMN size_bytes INTEGER DEFAULT 0",
+            "ALTER TABLE photos ADD COLUMN attempts INTEGER DEFAULT 0",
+            "ALTER TABLE photos ADD COLUMN claimed_at TEXT",
+            "ALTER TABLE photos ADD COLUMN next_attempt_at TEXT",
             "ALTER TABLE events ADD COLUMN owner_id TEXT",
             "ALTER TABLE events ADD COLUMN start_date TEXT",
             "ALTER TABLE events ADD COLUMN end_date TEXT",
@@ -123,6 +126,8 @@ class Database:
 
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_owner ON events (owner_id)")
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_photos_status ON photos (status)")
         await self.connection.commit()
 
     async def fetch_one(self, query, params=()):
