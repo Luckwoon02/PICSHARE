@@ -15,6 +15,36 @@ export interface User {
     email: string;
 }
 
+/** What an event includes. Chosen when it is created (it is priced) and fixed afterwards. */
+export type EventPlan = "selection" | "selection_face_scan" | "face_scan";
+
+export const PLAN_INFO: Record<
+    EventPlan,
+    { label: string; short: string; blurb: string; selection: boolean; faceScan: boolean }
+> = {
+    selection: {
+        label: "Photo selection",
+        short: "Selection",
+        blurb: "Your client picks the album photos from the full set. No face recognition.",
+        selection: true,
+        faceScan: false,
+    },
+    selection_face_scan: {
+        label: "Photo selection + face scan",
+        short: "Selection + faces",
+        blurb: "Album picking, and guests find their own photos with a selfie.",
+        selection: true,
+        faceScan: true,
+    },
+    face_scan: {
+        label: "Face scan",
+        short: "Face scan",
+        blurb: "Guests find and download their own photos with a selfie. No album picking.",
+        selection: false,
+        faceScan: true,
+    },
+};
+
 export interface EventItem {
     _id: string;
     name: string;
@@ -27,6 +57,9 @@ export interface EventItem {
     amount_cents: number;
     payment_status: string;
     secret_code?: string | null;
+    selection_enabled: boolean;
+    face_scan_enabled: boolean;
+    plan: EventPlan;
     created_at: string;
 }
 
@@ -35,6 +68,9 @@ export interface PaymentConfig {
     provider: string;
     currency: string;
     price_per_gb_cents: number;
+    /** flat add-ons per event; 0 = included in the storage price */
+    price_face_scan_cents: number;
+    price_selection_cents: number;
     min_storage_gb: number;
     max_storage_gb: number;
 }

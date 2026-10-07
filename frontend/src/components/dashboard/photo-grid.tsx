@@ -156,8 +156,12 @@ function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: bool
         );
     };
 
+    // Stored and viewable, but the face scan didn't work out (the Retry button above offers it again)
+    const scanFailed = photo.status === "processed" && !!photo.error_detail;
+
     return (
         <div
+            title={scanFailed ? photo.error_detail ?? undefined : undefined}
             className={`group relative aspect-square rounded-xl overflow-hidden border-2 bg-muted transition-all ${
                 selected ? "border-indigo-500 ring-2 ring-indigo-200 dark:ring-indigo-900" : "border-transparent"
             }`}
@@ -206,6 +210,12 @@ function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: bool
             >
                 {selected && <Check className="w-3.5 h-3.5 text-white" />}
             </span>
+
+            {scanFailed && (
+                <span className="pointer-events-none absolute bottom-2 left-2 rounded-full bg-amber-500/90 text-white text-[10px] font-medium px-2 py-0.5">
+                    Face scan failed
+                </span>
+            )}
 
             {photo.faces_count > 0 && (
                 <span className="pointer-events-none absolute bottom-2 left-2 rounded-full bg-black/60 text-white text-[10px] font-medium px-2 py-0.5">

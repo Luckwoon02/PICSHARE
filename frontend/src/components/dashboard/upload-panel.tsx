@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { ImageIcon, Loader2, UploadCloud, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,9 @@ import { api, formatBytes, uploadToS3 } from "@/lib/api";
 
 const PARALLEL_UPLOADS = 6; // photos sent to S3 at once
 const COMPLETE_BATCH = 25; // tell the server about finished uploads in groups
-const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const SIGN_BATCH = 50; // upload links requested per call, just before they're needed
+const PAINT_EVERY_MS = 250; // how often the progress bar is redrawn
+const ALLOWED_TYPES = ["image/jpeg", "image/png"];
 
 interface SignedUpload {
     photo_id: string;
@@ -35,9 +37,20 @@ export function UploadPanel({
     const overLimit = remainingBytes !== null && totalBytes > remainingBytes;
     const uploading = progress !== null;
 
+    // Closing the tab stops the upload, so ask before letting that happen mid-batch
+    useEffect(() => {
+        if (!uploading) return;
+        const warn = (e: BeforeUnloadEvent) => {
+            e.preventDefault();
+            e.returnValue = "";
+        };
+        window.addEventListener("beforeunload", warn);
+        return () => window.removeEventListener("beforeunload", warn);
+    }, [uploading]);
+
     const addFiles = (list: FileList | File[]) => {
         const images = Array.from(list).filter((f) => ALLOWED_TYPES.includes(f.type));
-        if (images.length < Array.from(list).length) toast.error("Only JPG, PNG or WEBP images can be uploaded");
+        if (images.length < Array.from(list).length) toast.error("Only JPG or PNG images can be uploaded");
         // De-dupe by name+size so re-dropping the same batch doesn't double up
         setFiles((prev) => {
             const seen = new Set(prev.map((f) => `${f.name}:${f.size}`));
@@ -49,32 +62,60 @@ export function UploadPanel({
         setProgress(0);
         const failed: File[] = [];
         let succeeded = 0;
+        let signError: unknown = null;
         try {
-            // 1. Ask the server for a signed S3 link per photo (also reserves storage)
-            const { uploads } = await api<{ uploads: SignedUpload[] }>(`/photos/upload-urls?event_id=${eventId}`, {
-                method: "POST",
-                body: JSON.stringify({
-                    files: files.map((f) => ({ name: f.name, size: f.size, content_type: f.type })),
-                }),
-            });
+            // 1. Signed S3 links are requested a group at a time, just before they're needed. That lets
+            //    the first photo start right away, keeps the links fresh (they expire after an hour)
+            //    and has no limit on how many photos can be selected.
+            const signedGroups = new Map<number, Promise<SignedUpload[]>>();
+            const signGroup = (group: number) => {
+                let promise = signedGroups.get(group);
+                if (!promise) {
+                    const slice = files.slice(group * SIGN_BATCH, (group + 1) * SIGN_BATCH);
+                    promise = api<{ uploads: SignedUpload[] }>(`/photos/upload-urls?event_id=${eventId}`, {
+                        method: "POST",
+                        body: JSON.stringify({
+                            files: slice.map((f) => ({ name: f.name, size: f.size, content_type: f.type })),
+                        }),
+                    }).then((res) => res.uploads);
+                    signedGroups.set(group, promise);
+                }
+                return promise;
+            };
+            const signedUpload = async (i: number) => {
+                const group = Math.floor(i / SIGN_BATCH);
+                const position = i - group * SIGN_BATCH;
+                // Start on the next group once this one is half used, so uploads never wait on signing
+                if (position >= SIGN_BATCH / 2 && (group + 1) * SIGN_BATCH < files.length) {
+                    signGroup(group + 1).catch(() => {}); // a failure is reported when that group is needed
+                }
+                return (await signGroup(group))[position];
+            };
 
             // 2. Send photos straight to S3, a few at a time
             const sent = new Array(files.length).fill(0);
-            const report = () => setProgress(sent.reduce((a, b) => a + b, 0) / Math.max(totalBytes, 1));
+            let lastPaint = 0;
+            const report = (force = false) => {
+                const now = performance.now();
+                if (!force && now - lastPaint < PAINT_EVERY_MS) return; // progress events are far more frequent than needed
+                lastPaint = now;
+                setProgress(sent.reduce((a, b) => a + b, 0) / Math.max(totalBytes, 1));
+            };
             let flushing: Promise<void> = Promise.resolve();
             const doneIds: string[] = [];
             const failedIds: string[] = [];
 
-            // 3. Tell the server which uploads finished so it can start processing them
-            const flush = (force = false) => {
-                if (!force && doneIds.length < COMPLETE_BATCH) return;
-                const body = { uploaded: doneIds.splice(0), failed: failedIds.splice(0) };
-                if (body.uploaded.length === 0 && body.failed.length === 0) return;
+            // 3. Tell the server which uploads finished. Photos are only processed once the last call
+            //    (final) arrives, so processing doesn't compete with the upload for CPU and network.
+            const flush = (force = false, final = false) => {
+                if (!final && !force && doneIds.length < COMPLETE_BATCH) return;
+                const body = { uploaded: doneIds.splice(0), failed: failedIds.splice(0), final };
+                if (!final && body.uploaded.length === 0 && body.failed.length === 0) return;
                 flushing = flushing.then(() =>
                     api(`/photos/upload-complete?event_id=${eventId}`, { method: "POST", body: JSON.stringify(body) })
                         .then(() => undefined)
                         .catch((err) => {
-                            toast.error(err instanceof Error ? err.message : "Couldn't start processing");
+                            toast.error(err instanceof Error ? err.message : "Couldn't confirm the upload");
                         })
                 );
             };
@@ -83,7 +124,15 @@ export function UploadPanel({
             const worker = async () => {
                 while (next < files.length) {
                     const i = next++;
-                    const { url, fields, photo_id } = uploads[i];
+                    let signed: SignedUpload;
+                    try {
+                        signed = await signedUpload(i);
+                    } catch (err) {
+                        if (!signError) signError = err;
+                        failed.push(files[i]);
+                        continue;
+                    }
+                    const { url, fields, photo_id } = signed;
                     let ok = false;
                     for (let attempt = 0; attempt < 2 && !ok; attempt++) {
                         try {
@@ -109,7 +158,8 @@ export function UploadPanel({
                 }
             };
             await Promise.all(Array.from({ length: Math.min(PARALLEL_UPLOADS, files.length) }, worker));
-            flush(true);
+            report(true);
+            flush(true, true);
             await flushing;
         } catch (err) {
             toast.error(err instanceof Error ? err.message : "Upload failed");
@@ -118,7 +168,8 @@ export function UploadPanel({
             setProgress(null);
         }
 
-        if (succeeded > 0) toast.success(`Uploaded ${succeeded} photo${succeeded === 1 ? "" : "s"} — processing faces now`);
+        if (signError) toast.error(signError instanceof Error ? signError.message : "Couldn't start the upload");
+        if (succeeded > 0) toast.success(`Uploaded ${succeeded} photo${succeeded === 1 ? "" : "s"} — preparing them in the background`);
         if (failed.length > 0) toast.error(`${failed.length} photo${failed.length === 1 ? "" : "s"} failed to upload — press Upload to try again`);
         setFiles(failed);
         if (inputRef.current) inputRef.current.value = "";
@@ -152,7 +203,7 @@ export function UploadPanel({
                     ref={inputRef}
                     type="file"
                     multiple
-                    accept="image/*"
+                    accept="image/jpeg,image/png"
                     className="hidden"
                     onChange={(e) => e.target.files && addFiles(e.target.files)}
                 />
@@ -161,7 +212,7 @@ export function UploadPanel({
                 </div>
                 <p className="font-semibold">Drag &amp; drop photos here, or click to browse</p>
                 <p className="text-xs text-muted-foreground">
-                    JPG, PNG or WEBP
+                    JPG or PNG
                     {remainingBytes !== null && ` · ${formatBytes(Math.max(remainingBytes, 0))} of storage left`}
                 </p>
             </div>

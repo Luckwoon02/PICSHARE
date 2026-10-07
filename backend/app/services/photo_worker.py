@@ -3,12 +3,25 @@ photo_worker.py — durable background processing for uploaded photos.
 
 The `photos` table is the queue. A photo with status='pending' and an S3 key is a
 job waiting to run. A background loop claims jobs, runs the pipeline
-(download -> dimensions -> thumbnail -> face indexing) and records the result.
+(download -> thumbnail + Rekognition copy -> face indexing) and records the result.
 
 Because the queue lives in the database, nothing is lost if the server restarts:
-unfinished jobs are simply picked up again. Failed jobs retry with backoff and,
-once MAX_ATTEMPTS is used up, are marked 'error' so the dashboard's Retry button
-can offer them again.
+unfinished jobs are simply picked up again.
+
+Life of a photo:
+    pending_upload  signed link handed out, file not confirmed yet
+    uploaded        file is in S3, held back until the browser says the whole batch is done
+                    (so processing doesn't compete with the upload for CPU and network);
+                    released automatically if the browser goes quiet for UPLOAD_HOLD
+    pending         waiting for a worker slot
+    processed       done: thumbnail made and, if the event's plan includes face scan, faces indexed
+                    (error_detail holds a warning if the face scan didn't work out)
+    error           the file could not be read at all
+
+Retries happen in ONE place: the queue. A failed photo is requeued with backoff up to
+MAX_ATTEMPTS. Problems that retrying can't fix (a photo Rekognition will never accept) are
+not retried, and Amazon's rate limit pauses the whole queue instead of every photo retrying
+on its own.
 
 Columns used: status, attempts, claimed_at, next_attempt_at, error_detail.
 """
@@ -17,24 +30,23 @@ import os
 import uuid
 from datetime import datetime, timedelta
 
-from PIL import Image
+from botocore.exceptions import ClientError
 
 from app.core.config import get_settings
 from app.services.db import db
-from app.services.rekognition_service import rekognition_service
+from app.services.rekognition_service import classify_error, describe_error, rekognition_service
 from app.services.s3_service import s3_service
 from app.services.thumbnail_service import thumbnail_service
 
 settings = get_settings()
 
-CONCURRENCY = 8  # photos processed at once
+CONCURRENCY = max(1, settings.PHOTO_WORKER_CONCURRENCY)  # photos processed at once
 MAX_ATTEMPTS = 4  # per photo, across restarts and retries
 BACKOFF_BASE_SECONDS = 30  # wait before attempt n+1 is BASE * 2**(n-1)
 STALE_CLAIM = timedelta(minutes=10)  # a claim older than this is a crashed/hung job
 POLL_SECONDS = 5  # how often to look for due jobs when nothing wakes us
-
-STEP_RETRY_ATTEMPTS = 3  # quick in-process retries around each AWS call
-STEP_RETRY_BASE_DELAY = 1.0
+THROTTLE_PAUSE_SECONDS = 20  # how long the whole queue waits when Amazon says "slow down"
+UPLOAD_HOLD = timedelta(minutes=20)  # how long an uploaded photo waits for its batch to finish
 
 os.makedirs(settings.UPLOAD_ROOT, exist_ok=True)
 os.makedirs(settings.THUMBNAIL_ROOT, exist_ok=True)
@@ -60,25 +72,44 @@ def remove_silently(path: str) -> None:
         print(f"[cleanup] Could not remove {path}: {e}")
 
 
-async def with_retry(make_call, label: str):
-    """
-    Await make_call() up to STEP_RETRY_ATTEMPTS times with exponential backoff.
-    make_call is a zero-arg callable returning a fresh coroutine each time.
-    Re-raises the last error if every attempt fails.
-    """
-    for attempt in range(1, STEP_RETRY_ATTEMPTS + 1):
-        try:
-            return await make_call()
-        except Exception as e:
-            if attempt == STEP_RETRY_ATTEMPTS:
-                raise
-            delay = STEP_RETRY_BASE_DELAY * 2 ** (attempt - 1)
-            print(f"[retry] {label} failed ({type(e).__name__}: {e}); attempt {attempt}/{STEP_RETRY_ATTEMPTS}, retrying in {delay:.0f}s")
-            await asyncio.sleep(delay)
-
-
 def _now() -> datetime:
     return datetime.utcnow()
+
+
+# ---------------------------------------------------------------------------
+# Holding photos back while a batch is still uploading
+# ---------------------------------------------------------------------------
+
+def hold_deadline() -> str:
+    """When a freshly uploaded photo should be released if nobody asks for it sooner."""
+    return (_now() + UPLOAD_HOLD).isoformat()
+
+
+async def extend_hold(event_id: str) -> None:
+    """The browser is still uploading this event's batch: push the release time back."""
+    await db.execute(
+        "UPDATE photos SET next_attempt_at = ? WHERE event_id = ? AND status = 'uploaded'",
+        (hold_deadline(), event_id),
+    )
+
+
+async def release_event(event_id: str) -> None:
+    """The batch is done uploading: let the worker start on this event's photos."""
+    await db.execute(
+        "UPDATE photos SET status = 'pending', next_attempt_at = NULL "
+        "WHERE event_id = ? AND status = 'uploaded'",
+        (event_id,),
+    )
+    notify()
+
+
+async def _release_held() -> None:
+    """Release photos whose hold ran out, e.g. because the browser tab was closed mid-upload."""
+    await db.execute(
+        "UPDATE photos SET status = 'pending', next_attempt_at = NULL "
+        "WHERE status = 'uploaded' AND next_attempt_at <= ?",
+        (_now().isoformat(),),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +136,7 @@ async def start() -> None:
     # Single API process: anything still marked as claimed was cut off by the restart.
     await db.execute("UPDATE photos SET claimed_at = NULL WHERE status = 'pending'")
     _task = asyncio.create_task(_run(), name="photo-worker")
-    print("[worker] started")
+    print(f"[worker] started (concurrency {CONCURRENCY})")
 
 
 async def stop() -> None:
@@ -166,6 +197,7 @@ async def _run() -> None:
     while True:
         try:
             _wake.clear()
+            await _release_held()
             await _give_up_exhausted()
             free = CONCURRENCY - len(running)
             if free > 0:
@@ -190,10 +222,6 @@ async def _run() -> None:
 # One job
 # ---------------------------------------------------------------------------
 
-class _PermanentError(Exception):
-    """Retrying won't help (e.g. the file isn't a readable image)."""
-
-
 async def _process_safely(photo: dict) -> None:
     try:
         await _process(photo)
@@ -204,9 +232,18 @@ async def _process_safely(photo: dict) -> None:
         await _fail(photo, f"Unexpected error: {type(e).__name__}: {e}")
 
 
-async def _fail(photo: dict, reason: str, permanent: bool = False) -> None:
-    """Requeue with backoff, or mark as error once attempts are used up."""
+async def _fail(photo: dict, reason: str, permanent: bool = False, throttled: bool = False) -> None:
+    """Requeue with backoff, or mark as error once attempts are used up (or can't help)."""
     reason = reason[:500]
+    if throttled:
+        # Amazon's rate limit isn't this photo's fault: hand the attempt back and wait.
+        await db.execute(
+            "UPDATE photos SET claimed_at = NULL, attempts = MAX(attempts - 1, 0), "
+            "next_attempt_at = ?, error_detail = ? WHERE id = ?",
+            ((_now() + timedelta(seconds=THROTTLE_PAUSE_SECONDS)).isoformat(), reason, photo["id"]),
+        )
+        print(f"[worker] {photo['id']} waiting for Amazon's rate limit ({THROTTLE_PAUSE_SECONDS}s)")
+        return
     if permanent or photo["attempts"] >= MAX_ATTEMPTS:
         await db.execute(
             "UPDATE photos SET status = 'error', claimed_at = NULL, error_detail = ? WHERE id = ?",
@@ -230,67 +267,72 @@ async def _process(photo: dict) -> None:
     try:
         # 1. Fetch the original that the browser uploaded to S3
         try:
-            await with_retry(lambda: s3_service.download_file(s3_key, local), f"S3 download {photo_id}")
+            await s3_service.download_file(s3_key, local)
         except Exception as e:
-            return await _fail(photo, f"Could not read original from S3: {type(e).__name__}: {e}")
+            missing = isinstance(e, ClientError) and e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound")
+            return await _fail(photo, f"Could not read original from S3: {type(e).__name__}: {e}", permanent=missing)
 
-        # 2. Dimensions (a file that isn't a valid image will never succeed)
-        def _size(path: str):
-            with Image.open(path) as img:
-                return img.size
+        # Events without face scan (selection only) never call Rekognition
+        event = await db.fetch_one("SELECT face_scan_enabled FROM events WHERE id = ?", (event_id,))
+        face_scan = event is None or event["face_scan_enabled"] != 0
+
+        # 2. Read the image once: size, thumbnail, and (for face scan) a JPEG copy sized for Rekognition.
+        #    (A file that isn't a valid image will never succeed, so don't retry it.)
         try:
-            width, height = await asyncio.to_thread(_size, local)
+            prepared = await asyncio.to_thread(
+                thumbnail_service.prepare, local, thumb_local, ai_copy=face_scan
+            )
         except Exception as e:
             return await _fail(photo, f"Image read failed: {type(e).__name__}: {e}", permanent=True)
 
-        # 3. Thumbnail (non-fatal; skipped if an earlier attempt already made it)
+        # 3. Thumbnail upload (non-fatal; skipped if an earlier attempt already stored it)
         thumb_key = photo.get("thumbnail_s3_key")
         if not thumb_key:
             candidate = s3_thumbnail_key(event_id, photo_id)
             try:
-                await asyncio.to_thread(thumbnail_service.generate_thumbnail, local, thumb_local)
-                await with_retry(
-                    lambda: s3_service.upload_file(
-                        thumb_local, candidate, "image/jpeg",
-                        cache_control="private, max-age=31536000, immutable",
-                    ),
-                    f"S3 thumbnail {photo_id}",
+                await s3_service.upload_file(
+                    thumb_local, candidate, "image/jpeg",
+                    cache_control="private, max-age=31536000, immutable",
                 )
                 thumb_key = candidate
             except Exception as e:
                 print(f"[worker] thumbnail failed for {photo_id}: {type(e).__name__}: {e}")
         await db.execute(
             "UPDATE photos SET width = ?, height = ?, thumbnail_s3_key = ? WHERE id = ?",
-            (width, height, thumb_key, photo_id),
+            (prepared.width, prepared.height, thumb_key, photo_id),
         )
 
-        # 4. Face indexing — skipped if faces are already stored, so a retry never duplicates them
+        # 4. Face indexing — only for events whose plan includes it, and skipped if faces are
+        #    already stored, so a retry never duplicates them
         faces_count = (await db.fetch_one(
             "SELECT COUNT(*) AS n FROM faces WHERE photo_id = ?", (photo_id,)
         ))["n"]
         warning = None
-        if faces_count == 0:
+        scan_hopeless = False  # Rekognition rejected this very image: another try changes nothing
+        if face_scan and faces_count == 0:
             try:
-                faces = await with_retry(
-                    lambda: rekognition_service.index_photo_faces(s3_key, photo_id, event_id),
-                    f"Rekognition {photo_id}",
-                )
+                faces = await rekognition_service.index_image_bytes(prepared.ai_jpeg, photo_id, event_id)
                 now = _now().isoformat()
-                for face in faces:
-                    await db.execute(
-                        "INSERT INTO faces (id, photo_id, event_id, rekognition_face_id, created_at) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (str(uuid.uuid4()), photo_id, event_id, face["rekognition_face_id"], now),
-                    )
+                await db.executemany(
+                    "INSERT INTO faces (id, photo_id, event_id, rekognition_face_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(str(uuid.uuid4()), photo_id, event_id, f["rekognition_face_id"], now) for f in faces],
+                )
                 faces_count = len(faces)
             except Exception as e:
-                warning = f"Rekognition failed: {type(e).__name__}: {e}"
+                kind = classify_error(e)
+                if kind == "throttled":
+                    rekognition_service.pause(THROTTLE_PAUSE_SECONDS)
+                    return await _fail(photo, "Waiting for Amazon's rate limit before scanning faces", throttled=True)
+                warning = describe_error(e)
+                scan_hopeless = kind == "permanent"
 
-        if warning and photo["attempts"] < MAX_ATTEMPTS:
+        if warning and not scan_hopeless and photo["attempts"] < MAX_ATTEMPTS:
             return await _fail(photo, warning)  # try the whole job again later
 
-        # 5. Done. A last-attempt Rekognition failure still counts as processed, with the
-        #    warning kept so the dashboard's Retry button can offer it again.
+        # 5. Done. A face scan that can't succeed still leaves a usable photo (it has its thumbnail
+        #    and can be viewed and selected), with the warning kept so the dashboard shows it
+        #    and its Retry button can offer it again.
         await db.execute(
             """
             UPDATE photos SET status = 'processed', claimed_at = NULL, next_attempt_at = NULL,
@@ -299,7 +341,7 @@ async def _process(photo: dict) -> None:
             """,
             (faces_count, warning[:500] if warning else None, photo_id),
         )
-        print(f"[worker] done {photo_id} | {faces_count} face(s) | {width}x{height}")
+        print(f"[worker] done {photo_id} | {faces_count} face(s) | {prepared.width}x{prepared.height}")
     finally:
         remove_silently(local)
         remove_silently(thumb_local)

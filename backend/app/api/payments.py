@@ -26,6 +26,8 @@ async def payment_config():
         "provider": s.PAYMENT_PROVIDER,
         "currency": s.PAYMENT_CURRENCY,
         "price_per_gb_cents": s.PRICE_PER_GB_CENTS,
+        "price_face_scan_cents": s.PRICE_FACE_SCAN_CENTS,
+        "price_selection_cents": s.PRICE_SELECTION_CENTS,
         "min_storage_gb": s.MIN_STORAGE_GB,
         "max_storage_gb": s.MAX_STORAGE_GB,
     }

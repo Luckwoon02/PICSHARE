@@ -3,11 +3,11 @@ import uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal, Optional
 from app.api.auth import get_current_user
 from app.core.config import get_settings
 from app.services.db import db
-from app.services.event_access import get_owned_event
+from app.services.event_access import PLANS, get_owned_event, plan_of
 from app.services.payment_service import calculate_amount_cents
 from app.services.rekognition_service import rekognition_service
 
@@ -19,6 +19,8 @@ class EventCreate(BaseModel):
     end_date: datetime
     storage_capacity_gb: float = Field(gt=0)
     secret_code: Optional[str] = None
+    # What the event includes: photo selection, face scan, or both. Fixed once created (it is priced).
+    plan: Literal["selection", "selection_face_scan", "face_scan"] = "face_scan"
 
 class EventResponse(BaseModel):
     id: str = Field(alias="_id")
@@ -32,6 +34,9 @@ class EventResponse(BaseModel):
     amount_cents: int = 0
     payment_status: str = "not_required"  # pending, paid, skipped, not_required
     secret_code: Optional[str] = None
+    selection_enabled: bool = False
+    face_scan_enabled: bool = True
+    plan: str = "face_scan"  # selection, selection_face_scan, face_scan
     created_at: datetime
     sync_status: str = "idle"  # idle, syncing, completed, error
     last_sync_at: Optional[datetime] = None
@@ -47,6 +52,7 @@ class PublicEventResponse(BaseModel):
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     is_protected: bool
+    face_scan_enabled: bool = True  # guests can only find their photos when this is on
     created_at: datetime
 
     class Config:
@@ -65,11 +71,20 @@ def format_event(row):
     
     # Add protection flag
     d["is_protected"] = bool(d.get("secret_code"))
+
+    # Plan flags (stored as 0/1; rows from before plans existed have face scan and no selection)
+    face_scan = d.get("face_scan_enabled")
+    d["selection_enabled"] = bool(d.get("selection_enabled"))
+    d["face_scan_enabled"] = True if face_scan is None else bool(face_scan)
+    d["plan"] = plan_of(d["selection_enabled"], d["face_scan_enabled"])
     return d
 
 @router.get("/public/list", response_model=List[PublicEventResponse])
 async def list_public_events():
-    rows = await db.fetch_all("SELECT * FROM events WHERE status = 'active' ORDER BY date DESC")
+    # Events without face scan have nothing for guests to join, so they are not listed
+    rows = await db.fetch_all(
+        "SELECT * FROM events WHERE status = 'active' AND face_scan_enabled = 1 ORDER BY date DESC"
+    )
     return [format_event(row) for row in rows]
 
 @router.get("/public/{slug}", response_model=PublicEventResponse)
@@ -109,8 +124,8 @@ async def _unique_slug(name: str) -> str:
 @router.post("/", response_model=EventResponse)
 async def create_event(event: EventCreate, user: dict = Depends(get_current_user)):
     """
-    Create an event in `pending_payment` state. It becomes `active` (and gets its
-    Rekognition collection) once payment completes — see app/api/payments.py.
+    Create an event in `pending_payment` state. It becomes `active` once payment completes
+    (and gets its Rekognition collection if its plan includes face scan) — see app/api/payments.py.
     """
     settings = get_settings()
     if event.end_date < event.start_date:
@@ -121,6 +136,7 @@ async def create_event(event: EventCreate, user: dict = Depends(get_current_user
             detail=f"Storage must be between {settings.MIN_STORAGE_GB:g} and {settings.MAX_STORAGE_GB:g} GB",
         )
 
+    selection, face_scan = PLANS[event.plan]
     event_id = str(uuid.uuid4())
     slug = await _unique_slug(event.name)
     created_at = datetime.utcnow().isoformat()
@@ -129,8 +145,9 @@ async def create_event(event: EventCreate, user: dict = Depends(get_current_user
         INSERT INTO events (
             id, name, slug, date, start_date, end_date, storage_capacity_gb,
             secret_code, sync_status, created_at, owner_id,
-            status, amount_cents, payment_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            status, amount_cents, payment_status,
+            selection_enabled, face_scan_enabled
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         event_id,
         event.name.strip(),
@@ -144,8 +161,10 @@ async def create_event(event: EventCreate, user: dict = Depends(get_current_user
         created_at,
         user["id"],
         "pending_payment",
-        calculate_amount_cents(event.storage_capacity_gb),
+        calculate_amount_cents(event.storage_capacity_gb, selection=selection, face_scan=face_scan),
         "pending",
+        int(selection),
+        int(face_scan),
     ))
 
     row = await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,))
@@ -229,14 +248,15 @@ async def delete_event(event_id: str, user: dict = Depends(get_current_user)):
 
     settings = get_settings()
 
-    await get_owned_event(event_id, user)
+    event = await get_owned_event(event_id, user)
 
     try:
         photos = await db.fetch_all("SELECT * FROM photos WHERE event_id = ?", (event_id,))
         guests = await db.fetch_all("SELECT * FROM guests WHERE event_id = ?", (event_id,))
 
-        # --- Rekognition collection cleanup ---
-        await rekognition_service.delete_event_collection(event_id)
+        # --- Rekognition collection cleanup (only face-scan events have one) ---
+        if event.get("face_scan_enabled", 1):
+            await rekognition_service.delete_event_collection(event_id)
 
         # --- S3 cleanup: delete everything under the event prefix in one sweep ---
         s3_prefix = f"events/{event_id}/"

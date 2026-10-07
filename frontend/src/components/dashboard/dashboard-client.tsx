@@ -2,10 +2,10 @@
 
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, CalendarDays, CreditCard, HardDrive, Loader2, Plus, Sparkles } from "lucide-react";
+import { ArrowRight, CalendarDays, CreditCard, HardDrive, Layers, Loader2, Plus, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { api, formatDateRange, type EventItem } from "@/lib/api";
+import { api, formatDateRange, PLAN_INFO, type EventItem } from "@/lib/api";
 import { useAuth } from "@/lib/use-auth";
 import { StatusBadge } from "@/components/dashboard/status-badge";
 
@@ -117,6 +117,10 @@ function EventCard({ event }: { event: EventItem }) {
                 <p className="flex items-center gap-2">
                     <HardDrive className="w-4 h-4 shrink-0" />
                     {event.storage_capacity_gb ? `${event.storage_capacity_gb} GB storage` : "Unlimited storage"}
+                </p>
+                <p className="flex items-center gap-2">
+                    <Layers className="w-4 h-4 shrink-0" />
+                    {PLAN_INFO[event.plan].label}
                 </p>
             </div>
 

@@ -1,8 +1,42 @@
 import asyncio
+import time
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from app.core.config import get_settings
+
+# Errors where the image itself is the problem: sending it again will never work.
+PERMANENT_ERRORS = {
+    "ImageTooLargeException": "image is too large for face scan",
+    "InvalidImageFormatException": "image format is not supported (JPEG or PNG only)",
+    "InvalidParameterException": "image could not be scanned (too small or not a valid image)",
+    "InvalidS3ObjectException": "image could not be read from storage",
+    "AccessDeniedException": "AWS permission for face scan is missing",
+    "ResourceNotFoundException": "this event's face collection does not exist",
+}
+# Amazon is telling us to slow down. Not the photo's fault, so it must not use up the photo's attempts.
+THROTTLE_ERRORS = {"ProvisionedThroughputExceededException", "ThrottlingException", "Throttling"}
+
+
+def error_code(exc: Exception) -> str:
+    return exc.response["Error"]["Code"] if isinstance(exc, ClientError) else ""
+
+
+def classify_error(exc: Exception) -> str:
+    """'permanent' (never retry), 'throttled' (wait for Amazon) or 'transient' (try again later)."""
+    code = error_code(exc)
+    if code in PERMANENT_ERRORS:
+        return "permanent"
+    if code in THROTTLE_ERRORS:
+        return "throttled"
+    return "transient"
+
+
+def describe_error(exc: Exception) -> str:
+    code = error_code(exc)
+    if code in PERMANENT_ERRORS:
+        return f"Face scan skipped: {PERMANENT_ERRORS[code]}"
+    return f"Face scan failed: {type(exc).__name__}: {exc}"
 
 
 class RekognitionService:
@@ -13,10 +47,39 @@ class RekognitionService:
             region_name=s.AWS_REGION,
             aws_access_key_id=s.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=s.AWS_SECRET_ACCESS_KEY,
-            config=Config(max_pool_connections=32, retries={"max_attempts": 5, "mode": "adaptive"}),
+            # One quick retry for a network blip. Anything longer is the queue's job; stacking
+            # retries here as well multiplies the calls made against a throttled account.
+            config=Config(max_pool_connections=32, retries={"total_max_attempts": 2, "mode": "standard"}),
         )
         self.bucket = s.S3_BUCKET_NAME
         self.threshold = s.REKOGNITION_FACE_MATCH_THRESHOLD
+
+        # Spacing between IndexFaces calls, so we stay under the account's requests-per-second quota.
+        self._interval = 1.0 / max(s.REKOGNITION_MAX_TPS, 0.1)
+        self._next_slot = 0.0
+        self._slot_lock = asyncio.Lock()
+        self._pause_until = 0.0
+
+    # ------------------------------------------------------------------
+    # Pacing
+    # ------------------------------------------------------------------
+
+    def pause(self, seconds: float) -> None:
+        """Hold back every IndexFaces call for a while (Amazon said it was being asked too much)."""
+        self._pause_until = max(self._pause_until, time.monotonic() + seconds)
+
+    async def _wait_turn(self) -> None:
+        while True:
+            delay = self._pause_until - time.monotonic()
+            if delay <= 0:
+                break
+            await asyncio.sleep(delay)
+        async with self._slot_lock:
+            now = time.monotonic()
+            slot = max(self._next_slot, now)
+            self._next_slot = slot + self._interval
+        if slot > now:
+            await asyncio.sleep(slot - now)
 
     # ------------------------------------------------------------------
     # Collection lifecycle
@@ -86,22 +149,37 @@ class RekognitionService:
 
         ExternalImageId is set to photo_id so SearchFacesByImage results can
         be mapped back to a photo without an extra DB lookup.
+
+        Amazon reads the image from S3, so it must be a JPEG/PNG under 15 MB. The photo
+        worker uses index_image_bytes instead, which has no such surprises.
         """
+        return await self._index_faces(
+            {"S3Object": {"Bucket": self.bucket, "Name": s3_object_key}}, photo_id, event_id
+        )
+
+    async def index_image_bytes(
+        self, image_bytes: bytes, photo_id: str, event_id: str
+    ) -> list[dict]:
+        """Like index_photo_faces, but sends the image itself (JPEG/PNG, at most 5 MB)."""
+        return await self._index_faces({"Bytes": image_bytes}, photo_id, event_id)
+
+    async def _index_faces(self, image: dict, photo_id: str, event_id: str) -> list[dict]:
         def _index():
             return self._client.index_faces(
                 CollectionId=event_id,
-                Image={"S3Object": {"Bucket": self.bucket, "Name": s3_object_key}},
+                Image=image,
                 ExternalImageId=photo_id,
                 DetectionAttributes=["DEFAULT"],
                 QualityFilter="AUTO",
             )
 
+        await self._wait_turn()
         try:
             response = await asyncio.to_thread(_index)
         except ClientError as e:
             # Never report "no faces" for a call that actually failed: raise so the
-            # worker retries and, if it keeps failing, records a warning on the photo.
-            print(f"[rekognition] index_faces error for {photo_id} ({e.response['Error']['Code']}): {e}")
+            # worker can decide what to do (retry later, or give up on this photo).
+            print(f"[rekognition] index_faces error for {photo_id} ({error_code(e)}): {e}")
             raise
 
         results = []

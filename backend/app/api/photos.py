@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 from typing import List
@@ -25,7 +26,7 @@ settings = get_settings()
 # ---------------------------------------------------------------------------
 
 STALE_UPLOAD_AFTER = timedelta(hours=1)  # a pending_upload older than this was abandoned
-_IMAGE_EXTS = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+_IMAGE_EXTS = {"image/jpeg": "jpg", "image/png": "png"}
 
 
 def _stale_cutoff() -> str:
@@ -67,8 +68,10 @@ class UploadUrlsRequest(BaseModel):
 
 
 class UploadCompleteRequest(BaseModel):
-    uploaded: List[str] = []
-    failed: List[str] = []
+    uploaded: List[str] = Field(default_factory=list, max_length=500)
+    failed: List[str] = Field(default_factory=list, max_length=500)
+    # True on the browser's last call: the whole batch is uploaded, so processing may start.
+    final: bool = False
 
 
 @router.post("/upload-urls")
@@ -82,23 +85,31 @@ async def create_upload_urls(
 
     for f in body.files:
         if f.content_type not in _IMAGE_EXTS:
-            raise HTTPException(status_code=400, detail=f"{f.name}: only JPG, PNG or WEBP images can be uploaded")
+            raise HTTPException(status_code=400, detail=f"{f.name}: only JPG or PNG images can be uploaded")
     await _check_capacity(event, sum(f.size for f in body.files))
 
-    uploads = []
-    for f in body.files:
-        photo_id = str(uuid.uuid4())
-        key = s3_original_key(event_id, photo_id, _IMAGE_EXTS[f.content_type])
-        presigned = await s3_service.create_presigned_upload(key, f.content_type, f.size)
-        await db.execute(
-            """
-            INSERT INTO photos (id, event_id, original_file_name, size_bytes, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (photo_id, event_id, f.name, f.size, "pending_upload", datetime.utcnow().isoformat()),
+    photo_ids = [str(uuid.uuid4()) for _ in body.files]
+    presigned = await asyncio.gather(*(
+        s3_service.create_presigned_upload(
+            s3_original_key(event_id, photo_id, _IMAGE_EXTS[f.content_type]), f.content_type, f.size
         )
-        uploads.append({"photo_id": photo_id, "url": presigned["url"], "fields": presigned["fields"]})
-    return {"uploads": uploads}
+        for photo_id, f in zip(photo_ids, body.files)
+    ))
+
+    now = datetime.utcnow().isoformat()
+    await db.executemany(
+        """
+        INSERT INTO photos (id, event_id, original_file_name, size_bytes, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [(photo_id, event_id, f.name, f.size, "pending_upload", now) for photo_id, f in zip(photo_ids, body.files)],
+    )
+    return {
+        "uploads": [
+            {"photo_id": photo_id, "url": p["url"], "fields": p["fields"]}
+            for photo_id, p in zip(photo_ids, presigned)
+        ]
+    }
 
 
 @router.post("/upload-complete")
@@ -107,55 +118,69 @@ async def complete_uploads(
     body: UploadCompleteRequest,
     user: dict = Depends(get_current_user),
 ):
-    """Browser reports which direct uploads finished; start processing those."""
+    """
+    Browser reports which direct uploads finished.
+
+    Confirmed photos are parked as 'uploaded' so processing doesn't compete with the rest of
+    the batch for CPU and network. The browser's last call (final=true) releases them to the
+    worker. If the browser goes quiet (tab closed), the worker releases them on its own after
+    photo_worker.UPLOAD_HOLD.
+    """
     await get_owned_active_event(event_id, user)
 
     async def _own_pending(ids: List[str]) -> list[dict]:
-        rows = []
-        for photo_id in ids:
-            row = await db.fetch_one(
-                """
-                SELECT id, event_id, original_file_name, thumbnail_s3_key FROM photos
-                WHERE id = ? AND event_id = ? AND status = 'pending_upload'
+        rows: list[dict] = []
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            rows += await db.fetch_all(
+                f"""
+                SELECT id, original_file_name, size_bytes FROM photos
+                WHERE event_id = ? AND status = 'pending_upload' AND id IN ({marks})
                 """,
-                (photo_id, event_id),
+                (event_id, *chunk),
             )
-            if row:
-                rows.append(dict(row))
         return rows
 
-    for photo in await _own_pending(body.failed):
-        await db.execute("DELETE FROM photos WHERE id = ?", (photo["id"],))
+    await db.executemany("DELETE FROM photos WHERE id = ?", [(p["id"],) for p in await _own_pending(body.failed)])
 
-    queued, missing = 0, 0
-    for photo in await _own_pending(body.uploaded):
+    # Check each file reached S3, a few at a time.
+    sem = asyncio.Semaphore(10)
+
+    async def _locate(photo: dict) -> tuple[str, str | None, int | None]:
         # The key's extension came from the content type at signing time, which usually
         # matches the filename; try that first, then the other allowed extensions.
         ext = os.path.splitext(photo["original_file_name"] or "")[1].lstrip(".").lower()
         guess = "jpg" if ext == "jpeg" else ext
-        key = size = None
-        for candidate in dict.fromkeys([guess, *_IMAGE_EXTS.values()]):
-            if candidate not in _IMAGE_EXTS.values():
-                continue
-            k = s3_original_key(event_id, photo["id"], candidate)
-            size = await s3_service.get_object_size(k)
-            if size is not None:
-                key = k
-                break
-        if key is None:
-            missing += 1
-            await db.execute("DELETE FROM photos WHERE id = ?", (photo["id"],))
-            continue
-        # Queue it: the worker picks up status='pending' rows that have an S3 key.
-        await db.execute(
-            "UPDATE photos SET status = 'pending', s3_object_key = ?, size_bytes = ? WHERE id = ?",
-            (key, size, photo["id"]),
-        )
-        queued += 1
+        candidates = [c for c in dict.fromkeys([guess, *_IMAGE_EXTS.values()]) if c in _IMAGE_EXTS.values()]
+        async with sem:
+            for candidate in candidates:
+                key = s3_original_key(event_id, photo["id"], candidate)
+                try:
+                    size = await s3_service.get_object_size(key)
+                except Exception as e:
+                    # Can't tell right now. Keep the photo and let the worker find out.
+                    print(f"[upload-complete] could not check {key}: {type(e).__name__}: {e}")
+                    return photo["id"], key, photo["size_bytes"]
+                if size is not None:
+                    return photo["id"], key, size
+        return photo["id"], None, None
 
-    if queued:
-        photo_worker.notify()
-    return {"processing": queued, "missing": missing}
+    located = await asyncio.gather(*(_locate(p) for p in await _own_pending(body.uploaded)))
+    found = [(key, size, photo_id) for photo_id, key, size in located if key is not None]
+    missing = [(photo_id,) for photo_id, key, _ in located if key is None]
+
+    await db.executemany("DELETE FROM photos WHERE id = ?", missing)
+    await db.executemany(
+        "UPDATE photos SET status = 'uploaded', s3_object_key = ?, size_bytes = ?, next_attempt_at = ? WHERE id = ?",
+        [(key, size, photo_worker.hold_deadline(), photo_id) for key, size, photo_id in found],
+    )
+
+    if body.final:
+        await photo_worker.release_event(event_id)
+    else:
+        await photo_worker.extend_hold(event_id)
+    return {"processing": len(found), "missing": len(missing)}
 
 
 @router.post("/retry/{event_id}")
@@ -237,8 +262,8 @@ async def get_event_status(event_id: str, user: dict = Depends(get_current_user)
         """
         SELECT
             COUNT(*)                                        AS total,
-            SUM(status = 'pending')                        AS pending,
-            SUM(status = 'pending_upload' AND created_at >= ?) AS pending_upload,
+            SUM(status IN ('pending', 'uploaded'))         AS processing,
+            SUM(status = 'pending_upload' AND created_at >= ?) AS awaiting_upload,
             SUM(status = 'processed')                      AS processed,
             SUM(status = 'error')                          AS errors,
             COALESCE(SUM(faces_count), 0)                  AS total_faces
@@ -255,7 +280,11 @@ async def get_event_status(event_id: str, user: dict = Depends(get_current_user)
         "sync_status": event.get("sync_status", "idle"),
         "last_sync_at": event.get("last_sync_at"),
         "total": total,
-        "pending": (counts["pending"] or 0) + (counts["pending_upload"] or 0),
+        # processing: stored and waiting for / in the worker. awaiting_upload: link handed out,
+        # file not confirmed (these are abandoned if nothing happens for an hour). pending is both.
+        "pending": (counts["processing"] or 0) + (counts["awaiting_upload"] or 0),
+        "processing": counts["processing"] or 0,
+        "awaiting_upload": counts["awaiting_upload"] or 0,
         "processed": processed,
         "errors": counts["errors"] or 0,
         "total_faces": counts["total_faces"] or 0,

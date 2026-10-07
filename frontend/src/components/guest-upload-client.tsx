@@ -25,7 +25,7 @@ export default function GuestUploadClient() {
     const [polling, setPolling] = useState(false);
     const [matchCount, setMatchCount] = useState(0);
 
-    const [eventInfo, setEventInfo] = useState<{ name: string; is_protected: boolean } | null>(null);
+    const [eventInfo, setEventInfo] = useState<{ name: string; is_protected: boolean; face_scan_enabled?: boolean } | null>(null);
     const [secretCode, setSecretCode] = useState("");
     const [isVerified, setIsVerified] = useState(false);
     const [checkingEvent, setCheckingEvent] = useState(true);
@@ -296,6 +296,22 @@ export default function GuestUploadClient() {
         );
     }
 
+    // Events without face scan never indexed their photos, so a selfie search could only find nothing
+    if (eventInfo.face_scan_enabled === false) {
+        return (
+            <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
+                <Card className="w-full max-w-md border-none shadow-xl bg-card/80 backdrop-blur-md text-center p-6">
+                    <Camera className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+                    <h2 className="text-xl font-bold text-foreground mb-2">{eventInfo.name}</h2>
+                    <p className="text-muted-foreground">
+                        Finding your photos with a selfie isn&apos;t available for this event. Please ask the photographer
+                        for your photos.
+                    </p>
+                </Card>
+            </div>
+        );
+    }
+
     if (eventInfo?.is_protected && !isVerified) {
         return (
             <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-blue-100/20 via-background to-indigo-100/20 text-foreground transition-colors duration-300">
@@ -526,7 +542,7 @@ export default function GuestUploadClient() {
                                         type="file"
                                         id="selfie-input"
                                         className="hidden"
-                                        accept="image/*"
+                                        accept="image/jpeg,image/png"
                                         capture="user"
                                         onChange={(e) => {
                                             const f = e.target.files?.[0] || null;
@@ -553,7 +569,7 @@ export default function GuestUploadClient() {
                                             </div>
                                             <div className="space-y-1">
                                                 <p className="text-sm font-semibold text-foreground">Click to upload or drag & drop</p>
-                                                <p className="text-xs text-muted-foreground">PNG, JPG or WEBP (max. 10MB)</p>
+                                                <p className="text-xs text-muted-foreground">PNG or JPG (max. 10MB)</p>
                                             </div>
                                         </div>
                                     )}

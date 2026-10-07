@@ -1,12 +1,12 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, CalendarDays, Check, Copy, ExternalLink, Loader2, Lock, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { api, formatBytes, formatDateRange, type EventItem } from "@/lib/api";
+import { api, formatBytes, formatDateRange, PLAN_INFO, type EventItem } from "@/lib/api";
 import { useAuth } from "@/lib/use-auth";
 import { StatusBadge } from "@/components/dashboard/status-badge";
 import { UploadPanel } from "@/components/dashboard/upload-panel";
@@ -23,10 +23,20 @@ interface Storage {
 interface Progress {
     total: number;
     pending: number;
+    /** stored and waiting for, or in, the worker */
+    processing: number;
     processed: number;
     errors: number;
     total_faces: number;
 }
+
+// While photos are being processed the page checks the (tiny) status endpoint, and only reloads
+// the whole gallery when something has actually changed.
+const POLL_START_MS = 5000;
+const POLL_MAX_MS = 20000; // the check slows down to this while nothing changes or the tab is hidden
+const GALLERY_EVERY_MS = 15000; // the gallery is reloaded at most this often
+
+const finishedCount = (p: Progress | null) => (p ? p.processed + p.errors : 0);
 
 type Tab = "photos" | "guests";
 
@@ -57,19 +67,31 @@ export default function EventDetailClient() {
         }
     }, [id]);
 
-    const loadStats = useCallback(async () => {
+    const progressRef = useRef<Progress | null>(null);
+
+    // Just the processing counts: cheap, so it's what the polling uses
+    const loadStatus = useCallback(async () => {
         try {
-            const [s, p] = await Promise.all([
-                api<Storage>(`/events/${id}/storage`),
-                api<Progress>(`/photos/status/${id}`),
-            ]);
-            setStorage(s);
-            setProgress(p);
+            const p = await api<Progress>(`/photos/status/${id}`);
+            progressRef.current = p;
+            // Same numbers as before: keep the old object so the page doesn't redraw for nothing
+            setProgress((prev) => (prev && JSON.stringify(prev) === JSON.stringify(p) ? prev : p));
             return p;
         } catch {
             return null;
         }
     }, [id]);
+
+    // Counts plus storage usage (which makes the server list the event's files in S3)
+    const loadStats = useCallback(async () => {
+        try {
+            const [s, p] = await Promise.all([api<Storage>(`/events/${id}/storage`), loadStatus()]);
+            setStorage(s);
+            return p;
+        } catch {
+            return null;
+        }
+    }, [id, loadStatus]);
 
     const loadGuests = useCallback(async () => {
         try {
@@ -94,7 +116,7 @@ export default function EventDetailClient() {
                 setEvent(ev);
                 loadStats();
                 loadPhotos();
-                loadGuests();
+                if (ev.face_scan_enabled) loadGuests();
             })
             .catch((err) => {
                 toast.error(err.message);
@@ -102,17 +124,74 @@ export default function EventDetailClient() {
             });
     }, [user, id, router, loadStats, loadPhotos, loadGuests]);
 
-    // While photos are still being processed, poll so thumbnails/counts catch up
-    const pending = progress?.pending ?? 0;
+    // While photos are still being processed, keep thumbnails and counts up to date
+    const processing = progress?.processing ?? 0;
+    const hasWork = processing > 0;
     useEffect(() => {
-        if (!event || pending === 0) return;
-        const timer = setInterval(async () => {
-            const p = await loadStats();
-            await loadPhotos();
-            if (p && p.pending === 0) clearInterval(timer);
-        }, 4000);
-        return () => clearInterval(timer);
-    }, [event, pending, loadStats, loadPhotos]);
+        if (!event || !hasWork) return;
+        let cancelled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let delay = POLL_START_MS;
+        let loadedDone = finishedCount(progressRef.current);
+        let loadedAt = Date.now();
+        let inFlight = false;
+
+        const tick = async () => {
+            if (document.hidden) {
+                timer = setTimeout(tick, POLL_MAX_MS); // nobody is looking: check back rarely
+                return;
+            }
+            inFlight = true;
+            try {
+                const p = await loadStatus();
+                if (cancelled) return;
+                if (!p) {
+                    timer = setTimeout(tick, POLL_MAX_MS); // couldn't reach the server: don't hammer it
+                    return;
+                }
+                const changed = finishedCount(p) !== loadedDone;
+                if (changed && Date.now() - loadedAt >= GALLERY_EVERY_MS) {
+                    loadedDone = finishedCount(p);
+                    loadedAt = Date.now();
+                    await loadPhotos();
+                }
+                delay = changed ? POLL_START_MS : Math.min(delay * 1.5, POLL_MAX_MS);
+                if (!cancelled) timer = setTimeout(tick, delay);
+            } finally {
+                inFlight = false;
+            }
+        };
+
+        // Coming back to the tab: catch up right away instead of waiting out the slow hidden-tab timer
+        const onVisible = () => {
+            if (document.hidden || inFlight || cancelled) return;
+            clearTimeout(timer);
+            loadedAt = 0; // the gallery is stale after being away, so allow an immediate reload
+            delay = POLL_START_MS;
+            tick();
+        };
+        document.addEventListener("visibilitychange", onVisible);
+
+        timer = setTimeout(tick, delay);
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+            document.removeEventListener("visibilitychange", onVisible);
+        };
+    }, [event, hasWork, loadStatus, loadPhotos]);
+
+    // When everything has finished, refresh once so the last photos and the storage figure show up
+    const wasWorking = useRef(false);
+    useEffect(() => {
+        if (!event) return;
+        if (hasWork) {
+            wasWorking.current = true;
+        } else if (wasWorking.current) {
+            wasWorking.current = false;
+            loadStats();
+            loadPhotos();
+        }
+    }, [event, hasWork, loadStats, loadPhotos]);
 
     const refreshAfterChange = () => {
         loadStats();
@@ -172,7 +251,10 @@ export default function EventDetailClient() {
                     <div className="flex flex-wrap items-center gap-3">
                         <h1 className="text-3xl font-bold tracking-tight">{event.name}</h1>
                         <StatusBadge status={event.status} />
-                        {event.secret_code && (
+                        <span className="inline-flex items-center rounded-full bg-muted px-2.5 py-1 text-xs font-semibold text-muted-foreground">
+                            {PLAN_INFO[event.plan].label}
+                        </span>
+                        {event.face_scan_enabled && event.secret_code && (
                             <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 px-2.5 py-1 text-xs font-semibold">
                                 <Lock className="w-3 h-3" />
                                 Code: {event.secret_code}
@@ -184,18 +266,20 @@ export default function EventDetailClient() {
                         {formatDateRange(event.start_date ?? event.date, event.end_date)}
                     </p>
                 </div>
-                <div className="flex gap-2">
-                    <Button variant="outline" onClick={copyLink}>
-                        {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
-                        Copy guest link
-                    </Button>
-                    <Button asChild variant="outline">
-                        <a href={guestLink} target="_blank" rel="noopener noreferrer">
-                            <ExternalLink className="w-4 h-4" />
-                            Guest page
-                        </a>
-                    </Button>
-                </div>
+                {event.face_scan_enabled && (
+                    <div className="flex gap-2">
+                        <Button variant="outline" onClick={copyLink}>
+                            {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
+                            Copy guest link
+                        </Button>
+                        <Button asChild variant="outline">
+                            <a href={guestLink} target="_blank" rel="noopener noreferrer">
+                                <ExternalLink className="w-4 h-4" />
+                                Guest page
+                            </a>
+                        </Button>
+                    </div>
+                )}
             </header>
 
             {/* Stats */}
@@ -217,14 +301,18 @@ export default function EventDetailClient() {
                         />
                     </div>
                 </div>
-                <Stat label="Photos" value={progress ? `${progress.processed}/${progress.total}` : "—"} sub={pending > 0 ? `${pending} processing…` : undefined} />
-                <Stat label="Guests" value={String(storage?.guest_count ?? "—")} sub={progress ? `${progress.total_faces} faces indexed` : undefined} />
+                <Stat label="Photos" value={progress ? `${progress.processed}/${progress.total}` : "—"} sub={processing > 0 ? `${processing} processing…` : undefined} />
+                {event.face_scan_enabled ? (
+                    <Stat label="Guests" value={String(storage?.guest_count ?? "—")} sub={progress ? `${progress.total_faces} faces indexed` : undefined} />
+                ) : (
+                    <Stat label="Plan" value={PLAN_INFO[event.plan].short} sub="No face scan" />
+                )}
             </section>
 
             {/* Tabs */}
             <div className="space-y-6">
                 <div className="flex gap-1 border-b border-border" role="tablist">
-                    {(["photos", "guests"] as const).map((t) => (
+                    {(event.face_scan_enabled ? (["photos", "guests"] as const) : (["photos"] as const)).map((t) => (
                         <button
                             key={t}
                             role="tab"
@@ -244,7 +332,7 @@ export default function EventDetailClient() {
                     ))}
                 </div>
 
-                {tab === "photos" ? (
+                {tab === "photos" || !event.face_scan_enabled ? (
                     <div className="space-y-6">
                         <UploadPanel eventId={id} remainingBytes={remaining} onUploaded={refreshAfterChange} />
                         <PhotoGrid eventId={id} photos={photos} loading={loadingPhotos} onChanged={refreshAfterChange} />

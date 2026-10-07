@@ -198,9 +198,12 @@ cp backend/.env.example backend/.env
 | `AWS_REGION` | AWS region for S3 and Rekognition | `us-east-1` |
 | `S3_BUCKET_NAME` | S3 bucket to store photos | *(required)* |
 | `REKOGNITION_FACE_MATCH_THRESHOLD` | Minimum match confidence (0–100) | `80.0` |
+| `REKOGNITION_MAX_TPS` | Max face-indexing calls per second. AWS's default quota is 50 in us-east-1, us-west-2 and eu-west-1 and 5 elsewhere | `5` |
+| `PHOTO_WORKER_CONCURRENCY` | Photos processed at once by the background worker (each decodes a full-size image, so keep it low on a laptop) | `4` |
 | `PAYMENT_REQUIRED` | If `false`, event owners can skip checkout (dev/testing). Set `true` in production | `false` |
 | `PAYMENT_PROVIDER` | Payment gateway; only `mock` (simulated checkout) is implemented | `mock` |
 | `PRICE_PER_GB_CENTS` | Event price per GB of storage, in cents | `100` |
+| `PRICE_FACE_SCAN_CENTS` / `PRICE_SELECTION_CENTS` | Flat per-event add-on, in cents, when the event's plan includes face scan / photo selection. `0` = included in the storage price | `0` / `0` |
 | `MIN_STORAGE_GB` / `MAX_STORAGE_GB` | Allowed storage range when creating an event | `1` / `1000` |
 | `DB_PATH` | Path to SQLite database file | `data/app.db` |
 | `UPLOAD_ROOT` | Local staging dir for originals | `data/uploads/originals` |

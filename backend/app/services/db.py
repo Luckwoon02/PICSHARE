@@ -117,6 +117,10 @@ class Database:
             "ALTER TABLE events ADD COLUMN payment_status TEXT DEFAULT 'not_required'",
             "ALTER TABLE events ADD COLUMN payment_id TEXT",
             "ALTER TABLE events ADD COLUMN paid_at TEXT",
+            # Features the event's plan includes. Events created before plans existed had face
+            # scan and no photo selection, so those are the defaults.
+            "ALTER TABLE events ADD COLUMN selection_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE events ADD COLUMN face_scan_enabled INTEGER DEFAULT 1",
         ):
             try:
                 await self.connection.execute(ddl)
@@ -142,6 +146,14 @@ class Database:
 
     async def execute(self, query, params=()):
         await self.connection.execute(query, params)
+        await self.connection.commit()
+
+    async def executemany(self, query, params_list):
+        """Run one statement for many parameter sets in a single transaction (one commit)."""
+        params_list = list(params_list)
+        if not params_list:
+            return
+        await self.connection.executemany(query, params_list)
         await self.connection.commit()
 
 

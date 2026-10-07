@@ -141,10 +141,14 @@ async def guest_request(
     selfie: UploadFile = File(...),
 ):
     row = await db.fetch_one(
-        "SELECT id, secret_code FROM events WHERE slug = ? AND status = 'active'", (event_slug,)
+        "SELECT id, secret_code, face_scan_enabled FROM events WHERE slug = ? AND status = 'active'",
+        (event_slug,),
     )
     if not row:
         raise HTTPException(status_code=404, detail="Event not found")
+    if row["face_scan_enabled"] == 0:
+        # Its photos were never face-scanned, so a selfie search could only ever find nothing
+        raise HTTPException(status_code=403, detail="Finding photos by selfie isn't available for this event")
 
     event_id = row["id"]
     expected_code = row["secret_code"]

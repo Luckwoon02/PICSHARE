@@ -12,8 +12,17 @@ from math import ceil
 from app.core.config import get_settings
 
 
-def calculate_amount_cents(storage_capacity_gb: float) -> int:
-    return ceil(storage_capacity_gb * get_settings().PRICE_PER_GB_CENTS)
+def calculate_amount_cents(
+    storage_capacity_gb: float, selection: bool = False, face_scan: bool = True
+) -> int:
+    """Storage price plus a flat add-on for each feature the event's plan includes."""
+    s = get_settings()
+    total = ceil(storage_capacity_gb * s.PRICE_PER_GB_CENTS)
+    if face_scan:
+        total += s.PRICE_FACE_SCAN_CENTS
+    if selection:
+        total += s.PRICE_SELECTION_CENTS
+    return total
 
 
 class MockPaymentProvider:
