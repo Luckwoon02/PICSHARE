@@ -137,9 +137,24 @@ export function PhotoGrid({
     );
 }
 
+const IMAGE_RETRIES = 3;
+
 function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: boolean; onToggle: () => void }) {
-    const [imgFailed, setImgFailed] = useState(false);
-    const showImage = photo.presigned_thumbnail_url && !imgFailed;
+    // A thumbnail can fail to load for a moment (busy network, many images at once),
+    // so retry a few times before showing the placeholder. The count belongs to one URL,
+    // so a fresh URL starts again from zero.
+    const url = photo.presigned_thumbnail_url;
+    const [failures, setFailures] = useState<{ url: string | null | undefined; count: number }>({ url, count: 0 });
+    const attempt = failures.url === url ? failures.count : 0;
+    const imgFailed = attempt >= IMAGE_RETRIES;
+    const showImage = url && !imgFailed;
+
+    const onImageError = () => {
+        setTimeout(
+            () => setFailures((f) => ({ url, count: (f.url === url ? f.count : 0) + 1 })),
+            1500 * (attempt + 1)
+        );
+    };
 
     return (
         <div
@@ -150,11 +165,12 @@ function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: bool
             {showImage ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
+                    key={attempt}
                     src={photo.presigned_thumbnail_url!}
                     alt={photo.original_file_name}
                     loading="lazy"
                     className="w-full h-full object-cover"
-                    onError={() => setImgFailed(true)}
+                    onError={onImageError}
                 />
             ) : (
                 <div className="w-full h-full flex flex-col items-center justify-center gap-1 text-xs text-muted-foreground">

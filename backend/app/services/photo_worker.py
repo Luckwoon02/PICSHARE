@@ -250,7 +250,10 @@ async def _process(photo: dict) -> None:
             try:
                 await asyncio.to_thread(thumbnail_service.generate_thumbnail, local, thumb_local)
                 await with_retry(
-                    lambda: s3_service.upload_file(thumb_local, candidate, "image/jpeg"),
+                    lambda: s3_service.upload_file(
+                        thumb_local, candidate, "image/jpeg",
+                        cache_control="private, max-age=31536000, immutable",
+                    ),
                     f"S3 thumbnail {photo_id}",
                 )
                 thumb_key = candidate

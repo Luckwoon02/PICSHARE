@@ -1,4 +1,5 @@
 import asyncio
+import time
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -15,25 +16,35 @@ class S3Service:
             aws_secret_access_key=s.AWS_SECRET_ACCESS_KEY,
             # Regional endpoint so browser uploads aren't redirected (a redirect breaks CORS POSTs)
             endpoint_url=f"https://s3.{s.AWS_REGION}.amazonaws.com",
-            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "virtual"},
+                max_pool_connections=32,
+                retries={"max_attempts": 5, "mode": "adaptive"},
+            ),
         )
         self.bucket = s.S3_BUCKET_NAME
+        # (key, expiry) -> (url, reuse_until). See get_presigned_url.
+        self._url_cache: dict[tuple[str, int], tuple[str, float]] = {}
 
     # ------------------------------------------------------------------
     # Upload helpers
     # ------------------------------------------------------------------
 
     async def upload_file(
-        self, local_path: str, s3_key: str, content_type: str = "image/jpeg"
+        self,
+        local_path: str,
+        s3_key: str,
+        content_type: str = "image/jpeg",
+        cache_control: str | None = None,
     ) -> str:
         """Upload a local file to S3. Returns the s3_key on success."""
+        extra = {"ContentType": content_type}
+        if cache_control:
+            extra["CacheControl"] = cache_control
+
         def _upload():
-            self._client.upload_file(
-                local_path,
-                self.bucket,
-                s3_key,
-                ExtraArgs={"ContentType": content_type},
-            )
+            self._client.upload_file(local_path, self.bucket, s3_key, ExtraArgs=extra)
 
         await asyncio.to_thread(_upload)
         return s3_key
@@ -117,7 +128,19 @@ class S3Service:
     async def get_presigned_url(
         self, s3_key: str, expiry_seconds: int = 3600
     ) -> str:
-        """Generate a presigned GET URL valid for expiry_seconds."""
+        """
+        Presigned GET URL valid for at least a quarter of expiry_seconds.
+
+        The same URL is handed out repeatedly until then. A freshly signed URL differs
+        on every call, so the browser would treat each dashboard refresh as new images
+        and re-download every thumbnail.
+        """
+        cache_key = (s3_key, expiry_seconds)
+        now = time.monotonic()
+        hit = self._url_cache.get(cache_key)
+        if hit and hit[1] > now:
+            return hit[0]
+
         def _generate():
             return self._client.generate_presigned_url(
                 "get_object",
@@ -125,7 +148,11 @@ class S3Service:
                 ExpiresIn=expiry_seconds,
             )
 
-        return await asyncio.to_thread(_generate)
+        url = await asyncio.to_thread(_generate)
+        if len(self._url_cache) > 20000:  # keep memory bounded
+            self._url_cache = {k: v for k, v in self._url_cache.items() if v[1] > now}
+        self._url_cache[cache_key] = (url, now + expiry_seconds * 0.75)
+        return url
 
     async def get_presigned_download_url(
         self,

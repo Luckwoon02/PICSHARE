@@ -1,17 +1,8 @@
 import asyncio
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from app.core.config import get_settings
-
-
-# Errors worth retrying: throttling and temporary AWS-side failures.
-TRANSIENT_ERROR_CODES = {
-    "ThrottlingException",
-    "ProvisionedThroughputExceededException",
-    "InternalServerError",
-    "ServiceUnavailableException",
-    "RequestTimeout",
-}
 
 
 class RekognitionService:
@@ -22,6 +13,7 @@ class RekognitionService:
             region_name=s.AWS_REGION,
             aws_access_key_id=s.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=s.AWS_SECRET_ACCESS_KEY,
+            config=Config(max_pool_connections=32, retries={"max_attempts": 5, "mode": "adaptive"}),
         )
         self.bucket = s.S3_BUCKET_NAME
         self.threshold = s.REKOGNITION_FACE_MATCH_THRESHOLD
@@ -107,11 +99,10 @@ class RekognitionService:
         try:
             response = await asyncio.to_thread(_index)
         except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in TRANSIENT_ERROR_CODES:
-                raise  # let the caller retry
-            print(f"[rekognition] index_faces error for {photo_id} ({code}): {e}")
-            return []
+            # Never report "no faces" for a call that actually failed: raise so the
+            # worker retries and, if it keeps failing, records a warning on the photo.
+            print(f"[rekognition] index_faces error for {photo_id} ({e.response['Error']['Code']}): {e}")
+            raise
 
         results = []
         for record in response.get("FaceRecords", []):
