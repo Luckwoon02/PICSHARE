@@ -256,7 +256,10 @@ export function UploadPanel({
                                     style={{ width: `${Math.round((progress ?? 0) * 100)}%` }}
                                 />
                             </div>
-                            <p className="text-xs text-muted-foreground text-right">{Math.round((progress ?? 0) * 100)}%</p>
+                            <p className="flex justify-between gap-3 text-xs text-muted-foreground">
+                                <span>Keep this page open until the upload finishes; your photos are prepared right after.</span>
+                                <span>{Math.round((progress ?? 0) * 100)}%</span>
+                            </p>
                         </div>
                     )}
 

@@ -57,6 +57,60 @@ async def _check_capacity(event: dict, incoming: int) -> None:
         )
 
 
+ORPHAN_WINDOW = timedelta(hours=24)  # reserved-but-unconfirmed photos older than this are not looked for in S3
+
+
+def _candidate_keys(event_id: str, photo: dict) -> list[str]:
+    """
+    The S3 keys a reserved photo may have been uploaded under. The extension came from the content type
+    at signing time, which usually matches the filename; try that first, then the other allowed extensions.
+    """
+    ext = os.path.splitext(photo["original_file_name"] or "")[1].lstrip(".").lower()
+    guess = "jpg" if ext == "jpeg" else ext
+    candidates = [c for c in dict.fromkeys([guess, *_IMAGE_EXTS.values()]) if c in _IMAGE_EXTS.values()]
+    return [s3_original_key(event_id, photo["id"], c) for c in candidates]
+
+
+async def _adopt_uploaded_orphans(event_id: str) -> int:
+    """
+    Photos whose upload reached S3 but whose "finished" report never arrived (the page was reloaded or
+    closed mid-upload) are still marked pending_upload and would be lost. Find those that are really in
+    S3 and keep them. Only a positive answer from S3 counts: if S3 can't say, the photo is left alone.
+    """
+    cutoff = (datetime.utcnow() - ORPHAN_WINDOW).isoformat()
+    rows = await db.fetch_all(
+        "SELECT id, original_file_name FROM photos WHERE event_id = ? AND status = 'pending_upload' AND created_at >= ?",
+        (event_id, cutoff),
+    )
+    if not rows:
+        return 0
+    sem = asyncio.Semaphore(10)
+
+    async def _check(photo: dict) -> tuple[str, str, int] | None:
+        async with sem:
+            for key in _candidate_keys(event_id, photo):
+                try:
+                    size = await s3_service.get_object_size(key)
+                except Exception:
+                    return None
+                if size is not None:
+                    return photo["id"], key, size
+        return None
+
+    found = [r for r in await asyncio.gather(*(_check(p) for p in rows)) if r]
+    await db.executemany(
+        "UPDATE photos SET status = 'uploaded', s3_object_key = ?, size_bytes = ?, next_attempt_at = ? WHERE id = ?",
+        [(key, size, photo_worker.hold_deadline(), photo_id) for photo_id, key, size in found],
+    )
+    if found:
+        print(
+            f"[upload-complete] recovered {len(found)} photo(s) that reached S3 but were never confirmed "
+            f"(the upload was interrupted); {len(rows) - len(found)} other reserved photo(s) were not found in S3.",
+            flush=True,
+        )
+    return len(found)
+
+
 class UploadFileSpec(BaseModel):
     name: str
     size: int = Field(gt=0)
@@ -149,14 +203,8 @@ async def complete_uploads(
     unverified: list[tuple[str, str]] = []  # (key, error code) for files we couldn't check
 
     async def _locate(photo: dict) -> tuple[str, str | None, int | None]:
-        # The key's extension came from the content type at signing time, which usually
-        # matches the filename; try that first, then the other allowed extensions.
-        ext = os.path.splitext(photo["original_file_name"] or "")[1].lstrip(".").lower()
-        guess = "jpg" if ext == "jpeg" else ext
-        candidates = [c for c in dict.fromkeys([guess, *_IMAGE_EXTS.values()]) if c in _IMAGE_EXTS.values()]
         async with sem:
-            for candidate in candidates:
-                key = s3_original_key(event_id, photo["id"], candidate)
+            for key in _candidate_keys(event_id, photo):
                 try:
                     size = await s3_service.get_object_size(key)
                 except Exception as e:
@@ -187,11 +235,14 @@ async def complete_uploads(
         [(key, size, photo_worker.hold_deadline(), photo_id) for key, size, photo_id in found],
     )
 
+    adopted = 0
     if body.final:
+        # Last call of an upload (or the page found an interrupted one): rescue anything that did reach S3
+        adopted = await _adopt_uploaded_orphans(event_id)
         await photo_worker.release_event(event_id)
     else:
         await photo_worker.extend_hold(event_id)
-    return {"processing": len(found), "missing": len(missing)}
+    return {"processing": len(found), "missing": len(missing), "adopted": adopted}
 
 
 @router.post("/retry/{event_id}")
@@ -274,8 +325,9 @@ async def get_event_status(event_id: str, user: dict = Depends(get_current_user)
     counts = await db.fetch_one(
         """
         SELECT
-            COUNT(*)                                        AS total,
+            SUM(status != 'pending_upload')                AS total,  -- photos that arrived; the rest are counted in awaiting_upload
             SUM(status IN ('pending', 'uploaded'))         AS processing,
+            SUM(status = 'uploaded')                       AS held,
             SUM(status = 'pending_upload' AND created_at >= ?) AS awaiting_upload,
             SUM(status = 'processed')                      AS processed,
             SUM(status = 'error')                          AS errors,
@@ -297,6 +349,7 @@ async def get_event_status(event_id: str, user: dict = Depends(get_current_user)
         # file not confirmed (these are abandoned if nothing happens for an hour). pending is both.
         "pending": (counts["processing"] or 0) + (counts["awaiting_upload"] or 0),
         "processing": counts["processing"] or 0,
+        "held": counts["held"] or 0,
         "awaiting_upload": counts["awaiting_upload"] or 0,
         "processed": processed,
         "errors": counts["errors"] or 0,
@@ -317,7 +370,7 @@ async def get_event_photos(
     offset = (page - 1) * limit
 
     count_result = await db.fetch_one(
-        "SELECT COUNT(*) as total FROM photos WHERE event_id = ?", (event_id,)
+        "SELECT COUNT(*) as total FROM photos WHERE event_id = ? AND status != 'pending_upload'", (event_id,)
     )
     total = count_result["total"]
 
@@ -326,7 +379,7 @@ async def get_event_photos(
         SELECT id, original_file_name, s3_object_key, thumbnail_s3_key,
                width, height, faces_count, status, error_detail, created_at
         FROM photos
-        WHERE event_id = ?
+        WHERE event_id = ? AND status != 'pending_upload'
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
         """,

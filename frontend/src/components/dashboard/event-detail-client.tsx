@@ -25,6 +25,10 @@ interface Progress {
     pending: number;
     /** stored and waiting for, or in, the worker (older servers don't send it; `pending` is used then) */
     processing?: number;
+    /** uploaded photos still waiting for their upload batch to finish */
+    held?: number;
+    /** photos whose upload link was handed out but whose file hasn't arrived */
+    awaiting_upload?: number;
     processed: number;
     errors: number;
     total_faces: number;
@@ -113,6 +117,32 @@ export default function EventDetailClient() {
         }
     }, [id, loadStatus]);
 
+    // Photos that are stored but "waiting for the upload to finish", found when the page loads, belong to an
+    // upload that was interrupted (page reloaded or closed): nothing will ever finish it. Process them now
+    // instead of leaving them to a timeout, and recover any that reached storage without being confirmed.
+    const releaseInterrupted = useCallback(
+        async (held: number) => {
+            console.warn(`[picshare] ${held} photo(s) from an interrupted upload were waiting; processing them now.`);
+            try {
+                const res = await api<{ adopted?: number }>(`/photos/upload-complete?event_id=${id}`, {
+                    method: "POST",
+                    body: JSON.stringify({ uploaded: [], failed: [], final: true }),
+                });
+                const total = held + (res.adopted ?? 0);
+                toast.info(`An earlier upload didn't finish. Processing the ${total} photo${total === 1 ? "" : "s"} that reached storage.`);
+                const p = await loadStats();
+                loadPhotos();
+                if (p && (p.awaiting_upload ?? 0) > 0) {
+                    toast.warning(`${p.awaiting_upload} photo${p.awaiting_upload === 1 ? "" : "s"} never finished uploading. Please upload them again.`);
+                }
+            } catch (err) {
+                console.warn(`[picshare] couldn't release the interrupted upload: ${reason(err)}`);
+                toast.error(err instanceof Error ? err.message : "Couldn't process the photos from the earlier upload");
+            }
+        },
+        [id, loadStats, loadPhotos]
+    );
+
     const loadGuests = useCallback(async () => {
         try {
             const data = await api<{ guests: Guest[] }>(`/guests/event/${id}`);
@@ -134,7 +164,9 @@ export default function EventDetailClient() {
                     return;
                 }
                 setEvent(ev);
-                loadStats();
+                loadStats().then((p) => {
+                    if (p && (p.held ?? 0) > 0) releaseInterrupted(p.held ?? 0);
+                });
                 loadPhotos();
                 if (ev.face_scan_enabled !== false) loadGuests();
             })
@@ -142,7 +174,7 @@ export default function EventDetailClient() {
                 toast.error(err.message);
                 router.replace("/dashboard");
             });
-    }, [user, id, router, loadStats, loadPhotos, loadGuests]);
+    }, [user, id, router, loadStats, loadPhotos, loadGuests, releaseInterrupted]);
 
     // While photos are still being processed, keep thumbnails and counts up to date
     const processing = progress?.processing ?? progress?.pending ?? 0;

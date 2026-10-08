@@ -47,7 +47,8 @@ BACKOFF_BASE_SECONDS = 30  # wait before attempt n+1 is BASE * 2**(n-1)
 STALE_CLAIM = timedelta(minutes=10)  # a claim older than this is a crashed/hung job
 POLL_SECONDS = 5  # how often to look for due jobs when nothing wakes us
 THROTTLE_PAUSE_SECONDS = 20  # how long the whole queue waits when Amazon says "slow down"
-UPLOAD_HOLD = timedelta(minutes=20)  # how long an uploaded photo waits for its batch to finish
+UPLOAD_HOLD = timedelta(minutes=10)  # how long an uploaded photo waits for its batch to finish
+HELD_QUIET_SECONDS = 120  # held photos with no word from the browser for this long are reported as a problem
 REPORT_BUSY_SECONDS = 15  # queue summary interval while there is work in the queue
 REPORT_IDLE_SECONDS = 300  # ...and while the queue is idle but old problems remain
 
@@ -221,10 +222,12 @@ async def _report() -> None:
             SUM(status = 'pending' AND claimed_at IS NULL AND error_detail IS NOT NULL) AS retrying,
             SUM(status = 'processed')                                                   AS done,
             SUM(status = 'error')                                                       AS failed,
-            SUM(status = 'processed' AND thumbnail_s3_key IS NULL)                      AS no_preview
+            SUM(status = 'processed' AND thumbnail_s3_key IS NULL)                      AS no_preview,
+            MAX(CASE WHEN status = 'uploaded' THEN next_attempt_at END)                 AS hold_until
         FROM photos
         """
     )
+    hold_until = c.pop("hold_until", None)  # when the held photos will be released on their own
     c = {k: (v or 0) for k, v in c.items()}
     busy = c["held"] + c["running"] + c["waiting"] + c["retrying"] > 0
     reasons = await db.fetch_all(
@@ -254,6 +257,16 @@ async def _report() -> None:
         _log(f"  PROBLEM: {r['n']} photo(s) {labels[r['status']]}: {r['reason']}")
     if c["no_preview"]:
         _log(f"  PROBLEM: {c['no_preview']} photo(s) are processed but have no preview (use Retry on the dashboard)")
+    if c["held"] and hold_until:
+        release_at = datetime.fromisoformat(hold_until)
+        quiet = (_now() - (release_at - UPLOAD_HOLD)).total_seconds()  # time since the browser last reported
+        if quiet >= HELD_QUIET_SECONDS:
+            minutes = max(0, int((release_at - _now()).total_seconds() // 60))
+            _log(
+                f"  PROBLEM: {c['held']} photo(s) are uploaded but held back: the browser has not reported for "
+                f"{int(quiet)}s (page reloaded or closed mid-upload?). Opening the event page releases them; "
+                f"otherwise they start in about {minutes} min."
+            )
     if c["running"] == 0 and c["retrying"] == 0 and c["waiting"] > 0:
         _log("  PROBLEM: photos are waiting but none is running, so the worker may be stuck")
 
