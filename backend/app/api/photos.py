@@ -146,6 +146,7 @@ async def complete_uploads(
 
     # Check each file reached S3, a few at a time.
     sem = asyncio.Semaphore(10)
+    unverified: list[tuple[str, str]] = []  # (key, error code) for files we couldn't check
 
     async def _locate(photo: dict) -> tuple[str, str | None, int | None]:
         # The key's extension came from the content type at signing time, which usually
@@ -160,13 +161,23 @@ async def complete_uploads(
                     size = await s3_service.get_object_size(key)
                 except Exception as e:
                     # Can't tell right now. Keep the photo and let the worker find out.
-                    print(f"[upload-complete] could not check {key}: {type(e).__name__}: {e}")
+                    code = getattr(e, "response", {}).get("Error", {}).get("Code") or type(e).__name__
+                    unverified.append((key, code))
                     return photo["id"], key, photo["size_bytes"]
                 if size is not None:
                     return photo["id"], key, size
         return photo["id"], None, None
 
     located = await asyncio.gather(*(_locate(p) for p in await _own_pending(body.uploaded)))
+    if unverified:
+        codes = ", ".join(sorted({code for _, code in unverified}))
+        print(
+            f"[upload-complete] WARNING: could not confirm {len(unverified)} of {len(located)} file(s) in S3 "
+            f"({codes}). Keeping them so the worker checks again. If this repeats, check the bucket "
+            f"permissions (s3:GetObject and s3:ListBucket; without ListBucket S3 answers 403 for a missing "
+            f"file). First one: {unverified[0][0]}",
+            flush=True,
+        )
     found = [(key, size, photo_id) for photo_id, key, size in located if key is not None]
     missing = [(photo_id,) for photo_id, key, _ in located if key is None]
 
@@ -189,9 +200,10 @@ async def retry_failed_photos(
     user: dict = Depends(get_current_user),
 ):
     """
-    Re-run processing for failed photos (status=error) and for photos whose
-    face scan failed (processed with a warning). Needs the original in S3;
-    photos that never reached S3 must be re-uploaded.
+    Re-run processing for failed photos (status=error), for photos whose face scan
+    failed (processed with a warning) and for photos stored without a preview
+    (processed, no thumbnail). Needs the original in S3; photos that never reached
+    S3 must be re-uploaded.
     """
     await get_owned_active_event(event_id, user)
     rows = await db.fetch_all(
@@ -199,7 +211,8 @@ async def retry_failed_photos(
         SELECT id, event_id, original_file_name, s3_object_key, thumbnail_s3_key
         FROM photos
         WHERE event_id = ?
-          AND (status = 'error' OR (status = 'processed' AND error_detail IS NOT NULL))
+          AND (status = 'error'
+               OR (status = 'processed' AND (error_detail IS NOT NULL OR thumbnail_s3_key IS NULL)))
         """,
         (event_id,),
     )

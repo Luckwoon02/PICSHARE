@@ -45,6 +45,9 @@ export const PLAN_INFO: Record<
     },
 };
 
+/** Plan details for an event; servers from before plans existed don't send one, and those events were face scan. */
+export const planInfo = (plan?: EventPlan) => PLAN_INFO[plan ?? "face_scan"] ?? PLAN_INFO.face_scan;
+
 export interface EventItem {
     _id: string;
     name: string;

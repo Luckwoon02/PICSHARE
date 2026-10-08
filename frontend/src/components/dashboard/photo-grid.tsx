@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { Check, ImageIcon, Loader2, RefreshCw, Trash2, X } from "lucide-react";
+import { Check, ImageIcon, ImageOff, Loader2, RefreshCw, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
@@ -31,9 +31,9 @@ export function PhotoGrid({
     const [deleting, setDeleting] = useState(false);
     const [retrying, setRetrying] = useState(false);
 
-    // Failed outright, or processed but the face scan failed
+    // Failed outright, processed but the face scan failed, or stored without a preview
     const failedCount = photos.filter(
-        (p) => p.status === "error" || (p.status === "processed" && p.error_detail)
+        (p) => p.status === "error" || (p.status === "processed" && (p.error_detail || !p.presigned_thumbnail_url))
     ).length;
 
     const retryFailed = async () => {
@@ -150,6 +150,10 @@ function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: bool
     const showImage = url && !imgFailed;
 
     const onImageError = () => {
+        console.warn(
+            `[picshare] preview for "${photo.original_file_name}" failed to load (try ${attempt + 1} of ${IMAGE_RETRIES}). ` +
+                "Open the preview link in a new tab to see the error S3 returns."
+        );
         setTimeout(
             () => setFailures((f) => ({ url, count: (f.url === url ? f.count : 0) + 1 })),
             1500 * (attempt + 1)
@@ -159,9 +163,19 @@ function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: bool
     // Stored and viewable, but the face scan didn't work out (the Retry button above offers it again)
     const scanFailed = photo.status === "processed" && !!photo.error_detail;
 
+    // Processed, but there is nothing to show: no preview was made, or it won't load. Say so instead of
+    // spinning forever (the spinner is only for photos that are really still being processed).
+    const previewUnavailable = !showImage && photo.status === "processed";
+    const placeholderTitle =
+        photo.status === "error"
+            ? photo.error_detail ?? "Processing failed"
+            : previewUnavailable
+              ? photo.error_detail ?? (url ? "The preview couldn't be loaded" : "No preview was made for this photo")
+              : undefined;
+
     return (
         <div
-            title={scanFailed ? photo.error_detail ?? undefined : undefined}
+            title={scanFailed ? photo.error_detail ?? undefined : placeholderTitle}
             className={`group relative aspect-square rounded-xl overflow-hidden border-2 bg-muted transition-all ${
                 selected ? "border-indigo-500 ring-2 ring-indigo-200 dark:ring-indigo-900" : "border-transparent"
             }`}
@@ -184,6 +198,11 @@ function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: bool
                             <span className="text-red-500 font-medium" title={photo.error_detail ?? undefined}>
                                 Failed
                             </span>
+                        </>
+                    ) : previewUnavailable ? (
+                        <>
+                            <ImageOff className="w-5 h-5 text-amber-500" />
+                            <span className="text-amber-600 dark:text-amber-400 font-medium">Preview unavailable</span>
                         </>
                     ) : (
                         <>

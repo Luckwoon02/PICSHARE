@@ -40,8 +40,8 @@ export default function NewEventClient() {
     const gb = parseFloat(capacity);
     const capacityValid = gb >= config.min_storage_gb && gb <= config.max_storage_gb;
     const planInfo = PLAN_INFO[plan];
-    const faceScanFee = planInfo.faceScan ? config.price_face_scan_cents : 0;
-    const selectionFee = planInfo.selection ? config.price_selection_cents : 0;
+    const faceScanFee = planInfo.faceScan ? (config.price_face_scan_cents ?? 0) : 0;
+    const selectionFee = planInfo.selection ? (config.price_selection_cents ?? 0) : 0;
     const price = capacityValid ? Math.ceil(gb * config.price_per_gb_cents) + faceScanFee + selectionFee : 0;
 
     const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {

@@ -12,6 +12,8 @@ const SIGN_BATCH = 50; // upload links requested per call, just before they're n
 const PAINT_EVERY_MS = 250; // how often the progress bar is redrawn
 const ALLOWED_TYPES = ["image/jpeg", "image/png"];
 
+const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
 interface SignedUpload {
     photo_id: string;
     url: string;
@@ -115,6 +117,7 @@ export function UploadPanel({
                     api(`/photos/upload-complete?event_id=${eventId}`, { method: "POST", body: JSON.stringify(body) })
                         .then(() => undefined)
                         .catch((err) => {
+                            console.warn(`[picshare] couldn't tell the server the upload finished: ${reason(err)}`);
                             toast.error(err instanceof Error ? err.message : "Couldn't confirm the upload");
                         })
                 );
@@ -129,6 +132,7 @@ export function UploadPanel({
                         signed = await signedUpload(i);
                     } catch (err) {
                         if (!signError) signError = err;
+                        console.warn(`[picshare] couldn't get an upload link for "${files[i].name}": ${reason(err)}`);
                         failed.push(files[i]);
                         continue;
                     }
@@ -141,8 +145,9 @@ export function UploadPanel({
                                 report();
                             });
                             ok = true;
-                        } catch {
+                        } catch (err) {
                             sent[i] = 0;
+                            console.warn(`[picshare] upload of "${files[i].name}" failed (try ${attempt + 1} of 2): ${reason(err)}`);
                         }
                     }
                     if (ok) {
@@ -162,6 +167,7 @@ export function UploadPanel({
             flush(true, true);
             await flushing;
         } catch (err) {
+            console.error(`[picshare] upload stopped: ${reason(err)}`);
             toast.error(err instanceof Error ? err.message : "Upload failed");
             return;
         } finally {

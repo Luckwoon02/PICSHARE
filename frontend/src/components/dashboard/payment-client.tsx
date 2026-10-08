@@ -6,7 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, CalendarDays, CheckCircle2, CreditCard, FlaskConical, HardDrive, Layers, Loader2, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { api, formatDateRange, formatMoney, PLAN_INFO, type EventItem, type PaymentConfig } from "@/lib/api";
+import { api, formatDateRange, formatMoney, planInfo, type EventItem, type PaymentConfig } from "@/lib/api";
 import { useAuth } from "@/lib/use-auth";
 
 type Busy = null | "pay" | "fail" | "skip";
@@ -112,7 +112,7 @@ export default function PaymentClient() {
                             </p>
                             <p className="flex items-center gap-2">
                                 <Layers className="w-4 h-4" />
-                                {PLAN_INFO[event.plan].label}
+                                {planInfo(event.plan).label}
                             </p>
                         </div>
                     </div>

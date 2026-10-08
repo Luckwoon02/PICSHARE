@@ -3,10 +3,10 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { ArrowLeft, CalendarDays, Check, Copy, ExternalLink, Loader2, Lock, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, CalendarDays, Check, Copy, ExternalLink, Loader2, Lock, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { api, formatBytes, formatDateRange, PLAN_INFO, type EventItem } from "@/lib/api";
+import { api, formatBytes, formatDateRange, planInfo, type EventItem } from "@/lib/api";
 import { useAuth } from "@/lib/use-auth";
 import { StatusBadge } from "@/components/dashboard/status-badge";
 import { UploadPanel } from "@/components/dashboard/upload-panel";
@@ -23,8 +23,8 @@ interface Storage {
 interface Progress {
     total: number;
     pending: number;
-    /** stored and waiting for, or in, the worker */
-    processing: number;
+    /** stored and waiting for, or in, the worker (older servers don't send it; `pending` is used then) */
+    processing?: number;
     processed: number;
     errors: number;
     total_faces: number;
@@ -35,6 +35,9 @@ interface Progress {
 const POLL_START_MS = 5000;
 const POLL_MAX_MS = 20000; // the check slows down to this while nothing changes or the tab is hidden
 const GALLERY_EVERY_MS = 15000; // the gallery is reloaded at most this often
+const STALL_MS = 90000; // nothing finishing for this long, while photos are waiting, is reported as a problem
+
+const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 const finishedCount = (p: Progress | null) => (p ? p.processed + p.errors : 0);
 
@@ -55,12 +58,25 @@ export default function EventDetailClient() {
     const [tab, setTab] = useState<Tab>("photos");
     const [copied, setCopied] = useState(false);
     const [deleting, setDeleting] = useState(false);
+    const [statusError, setStatusError] = useState<string | null>(null); // why progress couldn't be read
+    const [stalled, setStalled] = useState(false); // photos are waiting but nothing has finished for a while
 
     const loadPhotos = useCallback(async () => {
         try {
             const data = await api<{ photos: Photo[] }>(`/photos/event/${id}/gallery?limit=1000`);
             setPhotos(data.photos);
+            // Say so in the console whenever the gallery has photos that won't look right
+            const bad = data.photos.filter(
+                (p) => p.status === "error" || (p.status === "processed" && (p.error_detail || !p.presigned_thumbnail_url))
+            );
+            if (bad.length > 0) {
+                console.warn(
+                    `[picshare] ${bad.length} of ${data.photos.length} photo(s) have a problem (first few):`,
+                    bad.slice(0, 5).map((p) => `${p.original_file_name}: ${p.error_detail ?? (p.status === "error" ? "failed" : "no preview")}`)
+                );
+            }
         } catch (err) {
+            console.warn(`[picshare] couldn't load the photo list: ${reason(err)}`);
             toast.error(err instanceof Error ? err.message : "Couldn't load photos");
         } finally {
             setLoadingPhotos(false);
@@ -76,8 +92,11 @@ export default function EventDetailClient() {
             progressRef.current = p;
             // Same numbers as before: keep the old object so the page doesn't redraw for nothing
             setProgress((prev) => (prev && JSON.stringify(prev) === JSON.stringify(p) ? prev : p));
+            setStatusError(null);
             return p;
-        } catch {
+        } catch (err) {
+            console.warn(`[picshare] couldn't read upload progress: ${reason(err)}`);
+            setStatusError(reason(err));
             return null;
         }
     }, [id]);
@@ -88,7 +107,8 @@ export default function EventDetailClient() {
             const [s, p] = await Promise.all([api<Storage>(`/events/${id}/storage`), loadStatus()]);
             setStorage(s);
             return p;
-        } catch {
+        } catch (err) {
+            console.warn(`[picshare] couldn't read storage usage: ${reason(err)}`);
             return null;
         }
     }, [id, loadStatus]);
@@ -116,7 +136,7 @@ export default function EventDetailClient() {
                 setEvent(ev);
                 loadStats();
                 loadPhotos();
-                if (ev.face_scan_enabled) loadGuests();
+                if (ev.face_scan_enabled !== false) loadGuests();
             })
             .catch((err) => {
                 toast.error(err.message);
@@ -125,7 +145,7 @@ export default function EventDetailClient() {
     }, [user, id, router, loadStats, loadPhotos, loadGuests]);
 
     // While photos are still being processed, keep thumbnails and counts up to date
-    const processing = progress?.processing ?? 0;
+    const processing = progress?.processing ?? progress?.pending ?? 0;
     const hasWork = processing > 0;
     useEffect(() => {
         if (!event || !hasWork) return;
@@ -135,6 +155,8 @@ export default function EventDetailClient() {
         let loadedDone = finishedCount(progressRef.current);
         let loadedAt = Date.now();
         let inFlight = false;
+        let lastCount = finishedCount(progressRef.current); // how many photos had finished at the last look
+        let lastMovedAt = Date.now(); // when that number last went up
 
         const tick = async () => {
             if (document.hidden) {
@@ -149,6 +171,25 @@ export default function EventDetailClient() {
                     timer = setTimeout(tick, POLL_MAX_MS); // couldn't reach the server: don't hammer it
                     return;
                 }
+                // Say what is wrong on every check, so a stuck or failing batch is never silent
+                const count = finishedCount(p);
+                if (count !== lastCount) {
+                    lastCount = count;
+                    lastMovedAt = Date.now();
+                }
+                const quietMs = Date.now() - lastMovedAt;
+                const isStalled = quietMs >= STALL_MS;
+                setStalled(isStalled);
+                if (isStalled) {
+                    console.warn(
+                        `[picshare] nothing has finished for ${Math.round(quietMs / 1000)}s while ${p.processing ?? p.pending} ` +
+                            "photo(s) are waiting. The server may be busy or stuck: check the backend terminal for [worker] lines."
+                    );
+                }
+                if (p.errors > 0) {
+                    console.warn(`[picshare] ${p.errors} photo(s) failed so far. Hover a "Failed" tile for the reason.`);
+                }
+
                 const changed = finishedCount(p) !== loadedDone;
                 if (changed && Date.now() - loadedAt >= GALLERY_EVERY_MS) {
                     loadedDone = finishedCount(p);
@@ -177,6 +218,7 @@ export default function EventDetailClient() {
             cancelled = true;
             clearTimeout(timer);
             document.removeEventListener("visibilitychange", onVisible);
+            setStalled(false); // a new batch starts without an old warning
         };
     }, [event, hasWork, loadStatus, loadPhotos]);
 
@@ -235,6 +277,10 @@ export default function EventDetailClient() {
         );
     }
 
+    // Older servers don't send the plan fields: treat such events as face scan, which is what they always were
+    const faceScan = event.face_scan_enabled !== false;
+    const plan = planInfo(event.plan);
+
     const remaining = storage && event.storage_capacity_gb ? Math.max(storage.capacity_bytes - storage.used_bytes, 0) : null;
     const usedPct = storage && storage.capacity_bytes > 0 ? Math.min((storage.used_bytes / storage.capacity_bytes) * 100, 100) : 0;
 
@@ -252,9 +298,9 @@ export default function EventDetailClient() {
                         <h1 className="text-3xl font-bold tracking-tight">{event.name}</h1>
                         <StatusBadge status={event.status} />
                         <span className="inline-flex items-center rounded-full bg-muted px-2.5 py-1 text-xs font-semibold text-muted-foreground">
-                            {PLAN_INFO[event.plan].label}
+                            {plan.label}
                         </span>
-                        {event.face_scan_enabled && event.secret_code && (
+                        {faceScan && event.secret_code && (
                             <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 px-2.5 py-1 text-xs font-semibold">
                                 <Lock className="w-3 h-3" />
                                 Code: {event.secret_code}
@@ -266,7 +312,7 @@ export default function EventDetailClient() {
                         {formatDateRange(event.start_date ?? event.date, event.end_date)}
                     </p>
                 </div>
-                {event.face_scan_enabled && (
+                {faceScan && (
                     <div className="flex gap-2">
                         <Button variant="outline" onClick={copyLink}>
                             {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
@@ -302,17 +348,32 @@ export default function EventDetailClient() {
                     </div>
                 </div>
                 <Stat label="Photos" value={progress ? `${progress.processed}/${progress.total}` : "—"} sub={processing > 0 ? `${processing} processing…` : undefined} />
-                {event.face_scan_enabled ? (
+                {faceScan ? (
                     <Stat label="Guests" value={String(storage?.guest_count ?? "—")} sub={progress ? `${progress.total_faces} faces indexed` : undefined} />
                 ) : (
-                    <Stat label="Plan" value={PLAN_INFO[event.plan].short} sub="No face scan" />
+                    <Stat label="Plan" value={plan.short} sub="No face scan" />
                 )}
             </section>
+
+            {/* Something is wrong with progress: say so instead of leaving stale numbers */}
+            {(statusError || (hasWork && stalled)) && (
+                <p
+                    role="status"
+                    className="flex items-start gap-2 rounded-lg border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-3 py-2 text-sm text-amber-800 dark:text-amber-300"
+                >
+                    <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                    <span>
+                        {statusError
+                            ? `Can't reach the server to check progress (${statusError}). ${hasWork ? "Retrying…" : "Reload the page to try again."}`
+                            : "Nothing has finished for over a minute, so the server may be busy or stuck. Check the backend terminal for [worker] lines."}
+                    </span>
+                </p>
+            )}
 
             {/* Tabs */}
             <div className="space-y-6">
                 <div className="flex gap-1 border-b border-border" role="tablist">
-                    {(event.face_scan_enabled ? (["photos", "guests"] as const) : (["photos"] as const)).map((t) => (
+                    {(faceScan ? (["photos", "guests"] as const) : (["photos"] as const)).map((t) => (
                         <button
                             key={t}
                             role="tab"
@@ -332,7 +393,7 @@ export default function EventDetailClient() {
                     ))}
                 </div>
 
-                {tab === "photos" || !event.face_scan_enabled ? (
+                {tab === "photos" || !faceScan ? (
                     <div className="space-y-6">
                         <UploadPanel eventId={id} remainingBytes={remaining} onUploaded={refreshAfterChange} />
                         <PhotoGrid eventId={id} photos={photos} loading={loadingPhotos} onChanged={refreshAfterChange} />

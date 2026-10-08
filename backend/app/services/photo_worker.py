@@ -27,6 +27,7 @@ Columns used: status, attempts, claimed_at, next_attempt_at, error_detail.
 """
 import asyncio
 import os
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -47,6 +48,8 @@ STALE_CLAIM = timedelta(minutes=10)  # a claim older than this is a crashed/hung
 POLL_SECONDS = 5  # how often to look for due jobs when nothing wakes us
 THROTTLE_PAUSE_SECONDS = 20  # how long the whole queue waits when Amazon says "slow down"
 UPLOAD_HOLD = timedelta(minutes=20)  # how long an uploaded photo waits for its batch to finish
+REPORT_BUSY_SECONDS = 15  # queue summary interval while there is work in the queue
+REPORT_IDLE_SECONDS = 300  # ...and while the queue is idle but old problems remain
 
 os.makedirs(settings.UPLOAD_ROOT, exist_ok=True)
 os.makedirs(settings.THUMBNAIL_ROOT, exist_ok=True)
@@ -74,6 +77,11 @@ def remove_silently(path: str) -> None:
 
 def _now() -> datetime:
     return datetime.utcnow()
+
+
+def _log(message: str) -> None:
+    """Print a timestamped worker line. flush=True so it shows up in the terminal right away."""
+    print(f"{datetime.now().strftime('%H:%M:%S')} [worker] {message}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +144,7 @@ async def start() -> None:
     # Single API process: anything still marked as claimed was cut off by the restart.
     await db.execute("UPDATE photos SET claimed_at = NULL WHERE status = 'pending'")
     _task = asyncio.create_task(_run(), name="photo-worker")
-    print(f"[worker] started (concurrency {CONCURRENCY})")
+    _log(f"started (concurrency {CONCURRENCY})")
 
 
 async def stop() -> None:
@@ -187,6 +195,69 @@ async def _claim(limit: int) -> list[dict]:
     return rows
 
 
+_last_check = 0.0  # monotonic time of the last queue check
+_last_idle_print = 0.0  # monotonic time of the last problem print while idle
+
+
+async def _report() -> None:
+    """
+    Every REPORT_BUSY_SECONDS, look at the whole queue and print a one-line summary whenever there is
+    work in it, plus a PROBLEM line for anything that went wrong (grouped by reason). When the queue
+    is idle it only speaks up if old problems remain, and then only every REPORT_IDLE_SECONDS.
+    Nothing is printed when the queue is idle and healthy.
+    """
+    global _last_check, _last_idle_print
+    now = time.monotonic()
+    if now - _last_check < REPORT_BUSY_SECONDS:
+        return
+    _last_check = now
+
+    c = await db.fetch_one(
+        """
+        SELECT
+            SUM(status = 'uploaded')                                                    AS held,
+            SUM(status = 'pending' AND claimed_at IS NOT NULL)                          AS running,
+            SUM(status = 'pending' AND claimed_at IS NULL AND error_detail IS NULL)     AS waiting,
+            SUM(status = 'pending' AND claimed_at IS NULL AND error_detail IS NOT NULL) AS retrying,
+            SUM(status = 'processed')                                                   AS done,
+            SUM(status = 'error')                                                       AS failed,
+            SUM(status = 'processed' AND thumbnail_s3_key IS NULL)                      AS no_preview
+        FROM photos
+        """
+    )
+    c = {k: (v or 0) for k, v in c.items()}
+    busy = c["held"] + c["running"] + c["waiting"] + c["retrying"] > 0
+    reasons = await db.fetch_all(
+        """
+        SELECT status, substr(error_detail, 1, 140) AS reason, COUNT(*) AS n
+        FROM photos WHERE error_detail IS NOT NULL AND status IN ('pending', 'error', 'processed')
+        GROUP BY status, reason ORDER BY n DESC LIMIT 3
+        """
+    )
+    problems = c["failed"] + c["no_preview"] + c["retrying"] > 0 or bool(reasons)
+
+    if not busy:
+        if not problems or now - _last_idle_print < REPORT_IDLE_SECONDS:
+            return
+        _last_idle_print = now
+
+    _log(
+        f"queue: running={c['running']} waiting={c['waiting']} retrying={c['retrying']} "
+        f"held={c['held']} | done={c['done']} failed={c['failed']}"
+    )
+    labels = {
+        "pending": "waiting to retry after",
+        "error": "FAILED for good",
+        "processed": "stored, but face scan failed",
+    }
+    for r in reasons:
+        _log(f"  PROBLEM: {r['n']} photo(s) {labels[r['status']]}: {r['reason']}")
+    if c["no_preview"]:
+        _log(f"  PROBLEM: {c['no_preview']} photo(s) are processed but have no preview (use Retry on the dashboard)")
+    if c["running"] == 0 and c["retrying"] == 0 and c["waiting"] > 0:
+        _log("  PROBLEM: photos are waiting but none is running, so the worker may be stuck")
+
+
 async def _run() -> None:
     running: set[asyncio.Task] = set()
 
@@ -205,12 +276,13 @@ async def _run() -> None:
                     task = asyncio.create_task(_process_safely(photo))
                     running.add(task)
                     task.add_done_callback(_done)
+            await _report()
         except asyncio.CancelledError:
             for task in running:
                 task.cancel()
             raise
         except Exception as e:
-            print(f"[worker] loop error: {type(e).__name__}: {e}")
+            _log(f"loop error: {type(e).__name__}: {e}")
 
         try:
             await asyncio.wait_for(_wake.wait(), timeout=POLL_SECONDS)
@@ -228,7 +300,7 @@ async def _process_safely(photo: dict) -> None:
     except asyncio.CancelledError:
         raise  # shutting down; the claim is released on next start
     except Exception as e:
-        print(f"[worker] unexpected error for {photo['id']}: {type(e).__name__}: {e}")
+        _log(f"unexpected error for {photo['id']}: {type(e).__name__}: {e}")
         await _fail(photo, f"Unexpected error: {type(e).__name__}: {e}")
 
 
@@ -242,21 +314,21 @@ async def _fail(photo: dict, reason: str, permanent: bool = False, throttled: bo
             "next_attempt_at = ?, error_detail = ? WHERE id = ?",
             ((_now() + timedelta(seconds=THROTTLE_PAUSE_SECONDS)).isoformat(), reason, photo["id"]),
         )
-        print(f"[worker] {photo['id']} waiting for Amazon's rate limit ({THROTTLE_PAUSE_SECONDS}s)")
+        _log(f"{photo['id']} waiting for Amazon's rate limit ({THROTTLE_PAUSE_SECONDS}s)")
         return
     if permanent or photo["attempts"] >= MAX_ATTEMPTS:
         await db.execute(
             "UPDATE photos SET status = 'error', claimed_at = NULL, error_detail = ? WHERE id = ?",
             (reason, photo["id"]),
         )
-        print(f"[worker] {photo['id']} failed for good: {reason}")
+        _log(f"{photo['id']} FAILED for good: {reason}")
         return
     delay = BACKOFF_BASE_SECONDS * 2 ** (photo["attempts"] - 1)
     await db.execute(
         "UPDATE photos SET claimed_at = NULL, next_attempt_at = ?, error_detail = ? WHERE id = ?",
         ((_now() + timedelta(seconds=delay)).isoformat(), reason, photo["id"]),
     )
-    print(f"[worker] {photo['id']} attempt {photo['attempts']}/{MAX_ATTEMPTS} failed ({reason}); retry in {delay}s")
+    _log(f"{photo['id']} attempt {photo['attempts']}/{MAX_ATTEMPTS} failed ({reason}); retry in {delay}s")
 
 
 async def _process(photo: dict) -> None:
@@ -285,7 +357,10 @@ async def _process(photo: dict) -> None:
         except Exception as e:
             return await _fail(photo, f"Image read failed: {type(e).__name__}: {e}", permanent=True)
 
-        # 3. Thumbnail upload (non-fatal; skipped if an earlier attempt already stored it)
+        # 3. Thumbnail upload (skipped if an earlier attempt already stored it). A photo without its
+        #    thumbnail would look "still processing" forever, so a failure here is a real failure:
+        #    the queue retries the photo with backoff, and after MAX_ATTEMPTS it shows as failed with
+        #    the reason. This happens before the face scan, so no Amazon call is repeated.
         thumb_key = photo.get("thumbnail_s3_key")
         if not thumb_key:
             candidate = s3_thumbnail_key(event_id, photo_id)
@@ -296,7 +371,7 @@ async def _process(photo: dict) -> None:
                 )
                 thumb_key = candidate
             except Exception as e:
-                print(f"[worker] thumbnail failed for {photo_id}: {type(e).__name__}: {e}")
+                return await _fail(photo, f"Could not save the preview to S3: {type(e).__name__}: {e}")
         await db.execute(
             "UPDATE photos SET width = ?, height = ?, thumbnail_s3_key = ? WHERE id = ?",
             (prepared.width, prepared.height, thumb_key, photo_id),
@@ -341,7 +416,7 @@ async def _process(photo: dict) -> None:
             """,
             (faces_count, warning[:500] if warning else None, photo_id),
         )
-        print(f"[worker] done {photo_id} | {faces_count} face(s) | {prepared.width}x{prepared.height}")
+        _log(f"done {photo_id} | {faces_count} face(s) | {prepared.width}x{prepared.height}")
     finally:
         remove_silently(local)
         remove_silently(thumb_local)
