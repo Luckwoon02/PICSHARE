@@ -1,7 +1,7 @@
 services:
   backend:
     build: ./backend
-    container_name: picshare-backend
+    container_name: pixello-backend
     volumes:
       - ./data:/app/data:z
     env_file:
@@ -9,7 +9,7 @@ services:
     restart: always
     ports:
       - 8000:8000
-    hostname: picshare-backend
+    hostname: pixello-backend
     mem_limit: 4G
     cpu_count: 2
 
@@ -19,7 +19,7 @@ services:
       args:
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
         - BACKEND_HOSTNAME=${BACKEND_HOSTNAME}
-    container_name: picshare-frontend
+    container_name: pixello-frontend
     ports:
       - "3005:3000"
     depends_on:
@@ -27,7 +27,7 @@ services:
     restart: always
     environment:
       - NEXT_PUBLIC_API_URL=/api
-      - BACKEND_HOSTNAME=picshare-backend
+      - BACKEND_HOSTNAME=pixello-backend
 # Define named volumes if you prefer, but host-binding is simpler for VPS deployments
 # volumes:
 #   backend_data:

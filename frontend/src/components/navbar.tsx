@@ -26,7 +26,7 @@ export function Navbar() {
             <nav className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
                 <div className="container flex h-16 items-center justify-between px-4 max-w-6xl mx-auto">
                     <div className="flex gap-6 md:gap-10">
-                        <span className="font-bold text-xl tracking-tight">PICSHARE<span className="text-indigo-600">.</span></span>
+                        <span className="font-bold text-xl tracking-tight">PIXELLO<span className="text-indigo-600">.</span></span>
                     </div>
                     <div className="flex items-center gap-2">
                         <div className="w-9 h-9 border rounded-md animate-pulse bg-slate-100 dark:bg-slate-800" />
@@ -44,7 +44,7 @@ export function Navbar() {
                     <Link href="/" className="flex items-center space-x-2 group">
                         <Home className="w-5 h-5 text-indigo-600 group-hover:scale-110 transition-transform" />
                         <span className="font-bold text-xl tracking-tight group-hover:text-indigo-600 transition-colors">
-                            PICSHARE<span className="text-indigo-600 group-hover:text-indigo-400">.</span>
+                            PIXELLO<span className="text-indigo-600 group-hover:text-indigo-400">.</span>
                         </span>
                     </Link>
                 </div>

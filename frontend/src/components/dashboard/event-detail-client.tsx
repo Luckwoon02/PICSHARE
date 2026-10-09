@@ -75,12 +75,12 @@ export default function EventDetailClient() {
             );
             if (bad.length > 0) {
                 console.warn(
-                    `[picshare] ${bad.length} of ${data.photos.length} photo(s) have a problem (first few):`,
+                    `[pixello] ${bad.length} of ${data.photos.length} photo(s) have a problem (first few):`,
                     bad.slice(0, 5).map((p) => `${p.original_file_name}: ${p.error_detail ?? (p.status === "error" ? "failed" : "no preview")}`)
                 );
             }
         } catch (err) {
-            console.warn(`[picshare] couldn't load the photo list: ${reason(err)}`);
+            console.warn(`[pixello] couldn't load the photo list: ${reason(err)}`);
             toast.error(err instanceof Error ? err.message : "Couldn't load photos");
         } finally {
             setLoadingPhotos(false);
@@ -99,7 +99,7 @@ export default function EventDetailClient() {
             setStatusError(null);
             return p;
         } catch (err) {
-            console.warn(`[picshare] couldn't read upload progress: ${reason(err)}`);
+            console.warn(`[pixello] couldn't read upload progress: ${reason(err)}`);
             setStatusError(reason(err));
             return null;
         }
@@ -112,7 +112,7 @@ export default function EventDetailClient() {
             setStorage(s);
             return p;
         } catch (err) {
-            console.warn(`[picshare] couldn't read storage usage: ${reason(err)}`);
+            console.warn(`[pixello] couldn't read storage usage: ${reason(err)}`);
             return null;
         }
     }, [id, loadStatus]);
@@ -122,7 +122,7 @@ export default function EventDetailClient() {
     // instead of leaving them to a timeout, and recover any that reached storage without being confirmed.
     const releaseInterrupted = useCallback(
         async (held: number) => {
-            console.warn(`[picshare] ${held} photo(s) from an interrupted upload were waiting; processing them now.`);
+            console.warn(`[pixello] ${held} photo(s) from an interrupted upload were waiting; processing them now.`);
             try {
                 const res = await api<{ adopted?: number }>(`/photos/upload-complete?event_id=${id}`, {
                     method: "POST",
@@ -136,7 +136,7 @@ export default function EventDetailClient() {
                     toast.warning(`${p.awaiting_upload} photo${p.awaiting_upload === 1 ? "" : "s"} never finished uploading. Please upload them again.`);
                 }
             } catch (err) {
-                console.warn(`[picshare] couldn't release the interrupted upload: ${reason(err)}`);
+                console.warn(`[pixello] couldn't release the interrupted upload: ${reason(err)}`);
                 toast.error(err instanceof Error ? err.message : "Couldn't process the photos from the earlier upload");
             }
         },
@@ -214,12 +214,12 @@ export default function EventDetailClient() {
                 setStalled(isStalled);
                 if (isStalled) {
                     console.warn(
-                        `[picshare] nothing has finished for ${Math.round(quietMs / 1000)}s while ${p.processing ?? p.pending} ` +
+                        `[pixello] nothing has finished for ${Math.round(quietMs / 1000)}s while ${p.processing ?? p.pending} ` +
                             "photo(s) are waiting. The server may be busy or stuck: check the backend terminal for [worker] lines."
                     );
                 }
                 if (p.errors > 0) {
-                    console.warn(`[picshare] ${p.errors} photo(s) failed so far. Hover a "Failed" tile for the reason.`);
+                    console.warn(`[pixello] ${p.errors} photo(s) failed so far. Hover a "Failed" tile for the reason.`);
                 }
 
                 const changed = finishedCount(p) !== loadedDone;

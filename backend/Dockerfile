@@ -1,4 +1,4 @@
-# PicShare backend — AWS Rekognition + S3 edition
+# Pixello backend — AWS Rekognition + S3 edition
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1

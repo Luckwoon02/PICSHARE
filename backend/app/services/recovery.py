@@ -1,5 +1,5 @@
 """
-recovery.py — startup recovery tasks for PicShare.
+recovery.py — startup recovery tasks for Pixello.
 
 Resets events and photos that were left in intermediate states by a
 previous process crash or container restart.  Called once by cron_worker.py

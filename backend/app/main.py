@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 settings = get_settings()
 
-app = FastAPI(title="PicShare API", lifespan=lifespan, redirect_slashes=False)
+app = FastAPI(title="Pixello API", lifespan=lifespan, redirect_slashes=False)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,4 +44,4 @@ app.include_router(guests.router)
 
 @app.get("/")
 def read_root():
-    return {"message": "PicShare API is running"}
+    return {"message": "Pixello API is running"}

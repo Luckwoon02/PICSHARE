@@ -1,4 +1,4 @@
-# Contributing to Drive Photo Sharing System
+# Contributing to Pixello
 
 First off, thank you for considering contributing to this project! It's people like you who make the open-source community such an amazing place to learn, inspire, and create.
 

@@ -117,7 +117,7 @@ export function UploadPanel({
                     api(`/photos/upload-complete?event_id=${eventId}`, { method: "POST", body: JSON.stringify(body) })
                         .then(() => undefined)
                         .catch((err) => {
-                            console.warn(`[picshare] couldn't tell the server the upload finished: ${reason(err)}`);
+                            console.warn(`[pixello] couldn't tell the server the upload finished: ${reason(err)}`);
                             toast.error(err instanceof Error ? err.message : "Couldn't confirm the upload");
                         })
                 );
@@ -132,7 +132,7 @@ export function UploadPanel({
                         signed = await signedUpload(i);
                     } catch (err) {
                         if (!signError) signError = err;
-                        console.warn(`[picshare] couldn't get an upload link for "${files[i].name}": ${reason(err)}`);
+                        console.warn(`[pixello] couldn't get an upload link for "${files[i].name}": ${reason(err)}`);
                         failed.push(files[i]);
                         continue;
                     }
@@ -147,7 +147,7 @@ export function UploadPanel({
                             ok = true;
                         } catch (err) {
                             sent[i] = 0;
-                            console.warn(`[picshare] upload of "${files[i].name}" failed (try ${attempt + 1} of 2): ${reason(err)}`);
+                            console.warn(`[pixello] upload of "${files[i].name}" failed (try ${attempt + 1} of 2): ${reason(err)}`);
                         }
                     }
                     if (ok) {
@@ -167,7 +167,7 @@ export function UploadPanel({
             flush(true, true);
             await flushing;
         } catch (err) {
-            console.error(`[picshare] upload stopped: ${reason(err)}`);
+            console.error(`[pixello] upload stopped: ${reason(err)}`);
             toast.error(err instanceof Error ? err.message : "Upload failed");
             return;
         } finally {

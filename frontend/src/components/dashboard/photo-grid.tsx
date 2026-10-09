@@ -151,7 +151,7 @@ function PhotoTile({ photo, selected, onToggle }: { photo: Photo; selected: bool
 
     const onImageError = () => {
         console.warn(
-            `[picshare] preview for "${photo.original_file_name}" failed to load (try ${attempt + 1} of ${IMAGE_RETRIES}). ` +
+            `[pixello] preview for "${photo.original_file_name}" failed to load (try ${attempt + 1} of ${IMAGE_RETRIES}). ` +
                 "Open the preview link in a new tab to see the error S3 returns."
         );
         setTimeout(

@@ -1,6 +1,6 @@
-# 📸 PICSHARE | AI-Powered Event Photography
+# 📸 PIXELLO | AI-Powered Event Photography
 
-**PICSHARE** is a full-stack event photo sharing platform that uses **AWS Rekognition** for cloud-based face matching and **AWS S3** for scalable photo storage. Admins upload event photos, and guests find all their pictures instantly by submitting a single selfie.
+**PIXELLO** is a full-stack event photo sharing platform that uses **AWS Rekognition** for cloud-based face matching and **AWS S3** for scalable photo storage. Admins upload event photos, and guests find all their pictures instantly by submitting a single selfie.
 
 ![Project Status](https://img.shields.io/badge/Status-Beta-orange)
 
@@ -40,7 +40,7 @@
 ### Project Structure
 
 ```text
-PICSHARE/
+PIXELLO/
 ├── backend/
 │   ├── app/
 │   │   ├── api/
@@ -224,8 +224,8 @@ Docker Compose starts two services:
 
 | Service | Container | Port |
 |---|---|---|
-| FastAPI backend | `picshare-backend` | `8000` |
-| Next.js frontend | `picshare-frontend` | `3005` |
+| FastAPI backend | `pixello-backend` | `8000` |
+| Next.js frontend | `pixello-frontend` | `3005` |
 
 Access points:
 

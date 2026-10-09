@@ -1,7 +1,7 @@
 """
-cron_jobs.py — background job definitions for PicShare.
+cron_jobs.py — background job definitions for Pixello.
 
-The No-IP Dynamic DNS updater has been removed: PicShare now runs on AWS
+The No-IP Dynamic DNS updater has been removed: Pixello now runs on AWS
 and no longer requires self-hosted DNS management.
 
 Add new periodic tasks here as async functions and call them from

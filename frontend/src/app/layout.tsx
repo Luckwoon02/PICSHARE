@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: {
-    template: "%s | PICSHARE",
-    default: "PICSHARE | AI-Powered Event Photography",
+    template: "%s | PIXELLO",
+    default: "PIXELLO | AI-Powered Event Photography",
   },
   description: "Find every photo of yourself instantly with AI-powered face matching.",
 };

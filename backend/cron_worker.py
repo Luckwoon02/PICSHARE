@@ -1,5 +1,5 @@
 """
-cron_worker.py — startup worker for PicShare.
+cron_worker.py — startup worker for Pixello.
 
 Runs once on container start to:
   1. Connect to the database.
@@ -28,11 +28,11 @@ logging.basicConfig(
 
 
 async def main():
-    logging.info("PicShare cron worker starting...")
+    logging.info("Pixello cron worker starting...")
     await connect_to_db()
     try:
         await run_recovery_tasks()
-        logging.info("PicShare cron worker finished.")
+        logging.info("Pixello cron worker finished.")
     finally:
         await close_db_connection()
 

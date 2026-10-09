@@ -2,8 +2,8 @@ import Cookies from "js-cookie";
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 
-const TOKEN_COOKIE = "picshare_token";
-const AUTH_EVENT = "picshare-auth-change";
+const TOKEN_COOKIE = "pixello_token";
+const AUTH_EVENT = "pixello-auth-change";
 
 // ---------------------------------------------------------------------------
 // Types shared across the dashboard

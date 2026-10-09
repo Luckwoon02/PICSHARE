@@ -18,7 +18,7 @@ const COPY = {
         subtitle: "Log in to manage your events and photos.",
         submit: "Log in",
         busy: "Logging in…",
-        switchText: "New to PicShare?",
+        switchText: "New to Pixello?",
         switchLink: "Create an account",
         switchHref: "/register",
     },
