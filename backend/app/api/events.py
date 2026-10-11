@@ -7,7 +7,8 @@ from typing import List, Literal, Optional
 from app.api.auth import get_current_user
 from app.core.config import get_settings
 from app.services.db import db
-from app.services.event_access import PLANS, get_owned_event, plan_of
+from app.services import live_ingest
+from app.services.event_access import PLANS, get_owned_active_event, get_owned_event, plan_of
 from app.services.payment_service import calculate_amount_cents
 from app.services.rekognition_service import rekognition_service
 
@@ -37,6 +38,7 @@ class EventResponse(BaseModel):
     selection_enabled: bool = False
     face_scan_enabled: bool = True
     plan: str = "face_scan"  # selection, selection_face_scan, face_scan
+    live_enabled: bool = False  # photos pushed over FTP/SFTP into live/{id}/ are picked up automatically
     created_at: datetime
     sync_status: str = "idle"  # idle, syncing, completed, error
     last_sync_at: Optional[datetime] = None
@@ -77,6 +79,7 @@ def format_event(row):
     d["selection_enabled"] = bool(d.get("selection_enabled"))
     d["face_scan_enabled"] = True if face_scan is None else bool(face_scan)
     d["plan"] = plan_of(d["selection_enabled"], d["face_scan_enabled"])
+    d["live_enabled"] = bool(d.get("live_enabled"))
     return d
 
 @router.get("/public/list", response_model=List[PublicEventResponse])
@@ -202,6 +205,22 @@ async def update_event(event_id: str, event_data: dict, user: dict = Depends(get
 async def get_event(event_id: str, user: dict = Depends(get_current_user)):
     return format_event(await get_owned_event(event_id, user))
 
+class LiveToggle(BaseModel):
+    enabled: bool
+
+@router.patch("/{event_id}/live", response_model=EventResponse)
+async def set_live_mode(event_id: str, body: LiveToggle, user: dict = Depends(get_current_user)):
+    """
+    Switch live mode on or off. While it is on, photos that land in live/{event_id}/ (FTP/SFTP
+    uploads) are added to the event and processed. Switching it off stops picking up new files;
+    photos already added stay.
+    """
+    await get_owned_active_event(event_id, user)
+    await db.execute("UPDATE events SET live_enabled = ? WHERE id = ?", (int(body.enabled), event_id))
+    if body.enabled:
+        live_ingest.request_scan()  # pick up anything already waiting, don't wait for the next interval
+    return format_event(await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,)))
+
 @router.get("/{event_id}/storage")
 async def get_event_storage(event_id: str, user: dict = Depends(get_current_user)):
     """Storage usage vs. the capacity the owner purchased."""
@@ -221,6 +240,15 @@ async def get_event_storage(event_id: str, user: dict = Depends(get_current_user
     prefix = f"events/{event_id}/"
     try:
         event_storage, s3_object_count = await s3_service.get_prefix_size(prefix)
+        # Live-mode files sit in their own folder. Only look there for events that use live mode,
+        # so other events don't pay for a second listing.
+        has_live = bool(event.get("live_enabled")) or await db.fetch_one(
+            "SELECT 1 AS found FROM photos WHERE event_id = ? AND source = 'live' LIMIT 1", (event_id,)
+        )
+        if has_live:
+            live_bytes, live_count = await s3_service.get_prefix_size(live_ingest.live_prefix(event_id))
+            event_storage += live_bytes
+            s3_object_count += live_count
     except Exception as e:
         print(f"[storage] S3 list error for {event_id}: {e}")
         event_storage, s3_object_count = 0, 0
@@ -259,13 +287,14 @@ async def delete_event(event_id: str, user: dict = Depends(get_current_user)):
             await rekognition_service.delete_event_collection(event_id)
 
         # --- S3 cleanup: delete everything under the event prefix in one sweep ---
-        s3_prefix = f"events/{event_id}/"
-        try:
-            deleted_s3 = await s3_service.delete_prefix(s3_prefix)
-            print(f"[delete_event] Deleted {deleted_s3} S3 objects under {s3_prefix}")
-        except Exception as e:
-            # Log but don't abort — DB cleanup should still proceed
-            print(f"[delete_event] S3 cleanup error for {event_id}: {e}")
+        # (live mode files sit under live/{event_id}/, so sweep that folder too)
+        for s3_prefix in (f"events/{event_id}/", live_ingest.live_prefix(event_id)):
+            try:
+                deleted_s3 = await s3_service.delete_prefix(s3_prefix)
+                print(f"[delete_event] Deleted {deleted_s3} S3 objects under {s3_prefix}")
+            except Exception as e:
+                # Log but don't abort — DB cleanup should still proceed
+                print(f"[delete_event] S3 cleanup error for {event_id} ({s3_prefix}): {e}")
 
         # --- Local staging cleanup (files that may remain if processing failed) ---
         for photo in photos:

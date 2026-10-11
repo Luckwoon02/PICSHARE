@@ -10,6 +10,7 @@ import { api, formatBytes, formatDateRange, planInfo, type EventItem } from "@/l
 import { useAuth } from "@/lib/use-auth";
 import { StatusBadge } from "@/components/dashboard/status-badge";
 import { UploadPanel } from "@/components/dashboard/upload-panel";
+import { LiveModeCard } from "@/components/dashboard/live-mode-card";
 import { PhotoGrid, type Photo } from "@/components/dashboard/photo-grid";
 import { GuestsTable, type Guest } from "@/components/dashboard/guests-table";
 
@@ -32,6 +33,9 @@ interface Progress {
     processed: number;
     errors: number;
     total_faces: number;
+    /** photos that arrived over FTP/SFTP (live mode) and when the newest one did (older servers don't send these) */
+    live_count?: number;
+    last_live_at?: string | null;
 }
 
 // While photos are being processed the page checks the (tiny) status endpoint, and only reloads
@@ -40,10 +44,15 @@ const POLL_START_MS = 5000;
 const POLL_MAX_MS = 20000; // the check slows down to this while nothing changes or the tab is hidden
 const GALLERY_EVERY_MS = 15000; // the gallery is reloaded at most this often
 const STALL_MS = 90000; // nothing finishing for this long, while photos are waiting, is reported as a problem
+const LIVE_IDLE_MS = 20000; // live mode: how often to look for newly arrived photos while nothing is being processed
+const LIVE_STATS_MS = 60000; // live mode: the storage figure (the server lists the event's files in S3 for it) is refreshed at most this often
 
 const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 const finishedCount = (p: Progress | null) => (p ? p.processed + p.errors : 0);
+
+/** Changes whenever the gallery would look different: a photo arrived or one finished processing. */
+const progressSig = (p: Progress) => `${p.total}:${finishedCount(p)}`;
 
 type Tab = "photos" | "guests";
 
@@ -65,7 +74,13 @@ export default function EventDetailClient() {
     const [statusError, setStatusError] = useState<string | null>(null); // why progress couldn't be read
     const [stalled, setStalled] = useState(false); // photos are waiting but nothing has finished for a while
 
+    const progressRef = useRef<Progress | null>(null);
+    // What the progress looked like when the gallery was last loaded (live mode compares it with the server's numbers)
+    const gallerySig = useRef<string | null>(null);
+    const lastStatsAt = useRef(0); // live mode: when the storage figure was last refreshed
+
     const loadPhotos = useCallback(async () => {
+        gallerySig.current = progressRef.current ? progressSig(progressRef.current) : null;
         try {
             const data = await api<{ photos: Photo[] }>(`/photos/event/${id}/gallery?limit=1000`);
             setPhotos(data.photos);
@@ -86,8 +101,6 @@ export default function EventDetailClient() {
             setLoadingPhotos(false);
         }
     }, [id]);
-
-    const progressRef = useRef<Progress | null>(null);
 
     // Just the processing counts: cheap, so it's what the polling uses
     const loadStatus = useCallback(async () => {
@@ -254,18 +267,61 @@ export default function EventDetailClient() {
         };
     }, [event, hasWork, loadStatus, loadPhotos]);
 
-    // When everything has finished, refresh once so the last photos and the storage figure show up
+    // Live mode: photos can arrive at any moment, even while nothing is being processed. While the tab is open,
+    // look at the tiny status call now and then and reload the gallery when the photo count has moved. As soon as
+    // something is processing, the poller above takes over and this one pauses itself. Events without live mode
+    // never run this, so they make no extra requests.
+    const liveOn = event?.live_enabled === true;
+    useEffect(() => {
+        if (!event || !liveOn || hasWork) return;
+        let cancelled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
+        const tick = async () => {
+            if (!document.hidden) {
+                const p = await loadStatus();
+                if (cancelled) return;
+                if (p && progressSig(p) !== gallerySig.current) {
+                    loadPhotos();
+                    if (Date.now() - lastStatsAt.current >= LIVE_STATS_MS) {
+                        lastStatsAt.current = Date.now();
+                        loadStats();
+                    }
+                }
+            }
+            if (!cancelled) timer = setTimeout(tick, LIVE_IDLE_MS);
+        };
+
+        // Coming back to the tab: look right away instead of waiting out the interval
+        const onVisible = () => {
+            if (document.hidden || cancelled) return;
+            clearTimeout(timer);
+            tick();
+        };
+        document.addEventListener("visibilitychange", onVisible);
+
+        timer = setTimeout(tick, LIVE_IDLE_MS);
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+            document.removeEventListener("visibilitychange", onVisible);
+        };
+    }, [event, liveOn, hasWork, loadStatus, loadStats, loadPhotos]);
+
+    // When everything has finished, refresh once so the last photos and the storage figure show up.
+    // (Live events are skipped: photos keep arriving, so "everything has finished" happens again and again.
+    // The live check above refreshes them at a steady, limited pace instead.)
     const wasWorking = useRef(false);
     useEffect(() => {
         if (!event) return;
         if (hasWork) {
-            wasWorking.current = true;
+            wasWorking.current = !liveOn; // live events never arm this: the live check refreshes them
         } else if (wasWorking.current) {
             wasWorking.current = false;
             loadStats();
             loadPhotos();
         }
-    }, [event, hasWork, loadStats, loadPhotos]);
+    }, [event, hasWork, liveOn, loadStats, loadPhotos]);
 
     const refreshAfterChange = () => {
         loadStats();
@@ -401,6 +457,14 @@ export default function EventDetailClient() {
                     </span>
                 </p>
             )}
+
+            <LiveModeCard
+                eventId={id}
+                enabled={liveOn}
+                liveCount={progress?.live_count ?? 0}
+                lastLiveAt={progress?.last_live_at ?? null}
+                onChanged={setEvent}
+            />
 
             {/* Tabs */}
             <div className="space-y-6">

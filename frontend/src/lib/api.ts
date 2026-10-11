@@ -63,6 +63,8 @@ export interface EventItem {
     selection_enabled: boolean;
     face_scan_enabled: boolean;
     plan: EventPlan;
+    /** photos sent over FTP/SFTP are picked up automatically (older servers don't send it) */
+    live_enabled?: boolean;
     created_at: string;
 }
 

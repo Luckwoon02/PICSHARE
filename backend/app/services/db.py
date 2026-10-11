@@ -121,6 +121,10 @@ class Database:
             # scan and no photo selection, so those are the defaults.
             "ALTER TABLE events ADD COLUMN selection_enabled INTEGER DEFAULT 0",
             "ALTER TABLE events ADD COLUMN face_scan_enabled INTEGER DEFAULT 1",
+            # Live mode: photos arrive over FTP/SFTP into S3 under live/{event_id}/ and are picked up
+            # by app/services/live_ingest.py. 'source' tells those photos apart from browser uploads.
+            "ALTER TABLE events ADD COLUMN live_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE photos ADD COLUMN source TEXT DEFAULT 'browser'",
         ):
             try:
                 await self.connection.execute(ddl)
@@ -133,6 +137,18 @@ class Database:
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_status ON photos (status)")
         await self.connection.commit()
+
+        # One photo row per S3 object. S3 notifications arrive at least once, so live ingest can see the same
+        # key twice; this is the backstop that makes that harmless. (Skipped, with a warning, if a database
+        # somehow already holds two rows for one key: ingest still checks for an existing row first.)
+        try:
+            await self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_s3_key_unique "
+                "ON photos (s3_object_key) WHERE s3_object_key IS NOT NULL")
+            await self.connection.commit()
+        except Exception as e:
+            print(f"[db] could not create the unique index on photos.s3_object_key ({e}); "
+                  "duplicate rows for one S3 key exist and should be cleaned up", flush=True)
 
     async def fetch_one(self, query, params=()):
         async with self.connection.execute(query, params) as cursor:

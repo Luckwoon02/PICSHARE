@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     # Photos processed at once. Each one decodes a full-size image, so keep this low on a laptop.
     PHOTO_WORKER_CONCURRENCY: int = 4
 
+    # --- Live mode (photos pushed over FTP/SFTP into s3://bucket/live/{event_id}/) ---
+    # SQS queue that S3 sends "new object" notifications to (see backend/setup_live_ingest.py).
+    # Empty = no queue: the app finds new files by listing the bucket instead. Leave it empty on
+    # laptops, so teammates sharing a bucket can't take each other's messages.
+    INGEST_QUEUE_URL: str = ""
+    # How often the app lists live events' folders in S3 when there is no queue...
+    LIVE_POLL_SECONDS: int = 15
+    # ...and how often it does so as a safety net when there is one.
+    LIVE_SAFETY_SCAN_SECONDS: int = 300
+
     # --- Payments ---
     # While PAYMENT_REQUIRED is False, event owners may skip checkout (dev/testing).
     # Set it to True in production so an event only activates after a paid checkout.

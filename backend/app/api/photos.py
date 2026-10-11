@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.services import photo_worker
 from app.services.db import db
 from app.services.event_access import get_owned_event, get_owned_active_event
+from app.services import live_ingest
 from app.services.photo_worker import s3_original_key, remove_silently as _remove_silently
 from app.services.s3_service import s3_service
 
@@ -254,9 +255,10 @@ async def retry_failed_photos(
     Re-run processing for failed photos (status=error), for photos whose face scan
     failed (processed with a warning) and for photos stored without a preview
     (processed, no thumbnail). Needs the original in S3; photos that never reached
-    S3 must be re-uploaded.
+    S3 must be re-uploaded. Live photos that didn't fit the event's storage are
+    queued only if they fit now.
     """
-    await get_owned_active_event(event_id, user)
+    event = await get_owned_active_event(event_id, user)
     rows = await db.fetch_all(
         """
         SELECT id, event_id, original_file_name, s3_object_key, thumbnail_s3_key
@@ -264,8 +266,10 @@ async def retry_failed_photos(
         WHERE event_id = ?
           AND (status = 'error'
                OR (status = 'processed' AND (error_detail IS NOT NULL OR thumbnail_s3_key IS NULL)))
+          AND COALESCE(error_detail, '') NOT LIKE ?
         """,
-        (event_id,),
+        # Live photos that didn't fit the event's storage are handled separately below
+        (event_id, f"{live_ingest.OVER_LIMIT_MARKER}%"),
     )
 
     retrying, needs_reupload = 0, 0
@@ -291,14 +295,19 @@ async def retry_failed_photos(
         )
         retrying += 1
 
+    requeued, over_limit = await live_ingest.requeue_over_limit(event)  # notifies the worker itself
+    retrying += requeued
+
     if retrying:
         photo_worker.notify()
 
     return {
         "retrying": retrying,
         "needs_reupload": needs_reupload,
+        "over_limit": over_limit,  # live photos that still don't fit the event's storage
         "message": f"Retrying {retrying} photo(s)"
-        + (f"; {needs_reupload} must be re-uploaded" if needs_reupload else ""),
+        + (f"; {needs_reupload} must be re-uploaded" if needs_reupload else "")
+        + (f"; {over_limit} still don't fit in this event's storage" if over_limit else ""),
     }
 
 
@@ -331,7 +340,9 @@ async def get_event_status(event_id: str, user: dict = Depends(get_current_user)
             SUM(status = 'pending_upload' AND created_at >= ?) AS awaiting_upload,
             SUM(status = 'processed')                      AS processed,
             SUM(status = 'error')                          AS errors,
-            COALESCE(SUM(faces_count), 0)                  AS total_faces
+            COALESCE(SUM(faces_count), 0)                  AS total_faces,
+            COALESCE(SUM(source = 'live'), 0)              AS live_count,  -- photos that arrived over FTP/SFTP (live mode)
+            MAX(CASE WHEN source = 'live' THEN created_at END) AS last_live_at
         FROM photos WHERE event_id = ?
         """,
         (_stale_cutoff(), event_id),
@@ -354,6 +365,9 @@ async def get_event_status(event_id: str, user: dict = Depends(get_current_user)
         "processed": processed,
         "errors": counts["errors"] or 0,
         "total_faces": counts["total_faces"] or 0,
+        "live_count": counts["live_count"] or 0,
+        # stored as naive UTC; the "Z" stops browsers reading it as local time
+        "last_live_at": f"{counts['last_live_at']}Z" if counts["last_live_at"] else None,
         "progress": (processed / total * 100) if total > 0 else 0,
     }
 

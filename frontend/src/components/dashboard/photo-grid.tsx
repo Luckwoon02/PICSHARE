@@ -39,11 +39,13 @@ export function PhotoGrid({
     const retryFailed = async () => {
         setRetrying(true);
         try {
-            const res = await api<{ retrying: number; needs_reupload: number; message: string }>(
+            const res = await api<{ retrying: number; needs_reupload: number; over_limit?: number; message: string }>(
                 `/photos/retry/${eventId}`,
                 { method: "POST" }
             );
+            const overLimit = res.over_limit ?? 0;
             if (res.retrying > 0) toast.success(res.message);
+            else if (overLimit > 0) toast.error(`${overLimit} photo(s) don't fit in this event's storage. Delete photos you don't need, then retry.`);
             else toast.error(res.needs_reupload > 0 ? "These photos never reached storage — please upload them again" : "Nothing to retry");
             if (res.retrying > 0 && res.needs_reupload > 0) toast.info(`${res.needs_reupload} photo(s) must be re-uploaded`);
             onChanged();

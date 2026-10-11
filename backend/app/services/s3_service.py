@@ -235,6 +235,19 @@ class S3Service:
         await asyncio.to_thread(_sum)
         return total_bytes, total_count
 
+    async def list_prefix(self, prefix: str) -> list[tuple[str, int]]:
+        """(key, size in bytes) of every object under prefix. Folder placeholder keys (ending in "/") are left out."""
+        def _list():
+            found: list[tuple[str, int]] = []
+            paginator = self._client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    if not obj["Key"].endswith("/"):
+                        found.append((obj["Key"], obj["Size"]))
+            return found
+
+        return await asyncio.to_thread(_list)
+
 
 # Module-level singleton
 s3_service = S3Service()
