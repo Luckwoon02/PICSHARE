@@ -4,12 +4,13 @@ import React, { useState, useEffect } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
-import { Moon, Sun, Laptop, Home, Calendar, LogOut } from "lucide-react";
+import { Moon, Sun, Home, Calendar, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/lib/use-auth";
 
 export function Navbar() {
-    const { theme, setTheme } = useTheme();
+    // resolvedTheme is what is actually showing, even if the saved choice is still "system"
+    const { resolvedTheme, setTheme } = useTheme();
     const [mounted, setMounted] = useState(false);
     const pathname = usePathname();
     const { user, logout } = useAuth();
@@ -94,7 +95,7 @@ export function Navbar() {
                     <div className="flex items-center bg-slate-100 dark:bg-slate-800 rounded-full p-1 border border-slate-200 dark:border-slate-700 shadow-inner">
                         <button
                             onClick={() => setTheme("light")}
-                            className={`p-1.5 rounded-full transition-all ${theme === 'light'
+                            className={`p-1.5 rounded-full transition-all ${resolvedTheme === 'light'
                                 ? 'bg-white text-amber-500 shadow-sm'
                                 : 'text-slate-400 dark:hover:text-slate-200 hover:text-slate-600 uppercase'}`}
                             title="Light Mode"
@@ -103,21 +104,12 @@ export function Navbar() {
                         </button>
                         <button
                             onClick={() => setTheme("dark")}
-                            className={`p-1.5 rounded-full transition-all ${theme === 'dark'
+                            className={`p-1.5 rounded-full transition-all ${resolvedTheme === 'dark'
                                 ? 'bg-indigo-600 text-white shadow-sm'
                                 : 'text-slate-400 dark:hover:text-slate-200 hover:text-slate-600'}`}
                             title="Dark Mode"
                         >
                             <Moon className="w-4 h-4" />
-                        </button>
-                        <button
-                            onClick={() => setTheme("system")}
-                            className={`p-1.5 rounded-full transition-all ${theme === 'system'
-                                ? 'bg-slate-500 text-white shadow-sm'
-                                : 'text-slate-400 dark:hover:text-slate-200 hover:text-slate-600'}`}
-                            title="System Default"
-                        >
-                            <Laptop className="w-4 h-4" />
                         </button>
                     </div>
                 </div>
