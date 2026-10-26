@@ -68,6 +68,10 @@ def s3_thumbnail_key(event_id: str, photo_id: str) -> str:
     return f"events/{event_id}/thumbnails/{photo_id}.jpg"
 
 
+def s3_preview_key(event_id: str, photo_id: str) -> str:
+    return f"events/{event_id}/previews/{photo_id}.jpg"
+
+
 def remove_silently(path: str) -> None:
     try:
         if path and os.path.exists(path):
@@ -177,7 +181,7 @@ async def _claim(limit: int) -> list[dict]:
     now = _now()
     rows = await db.fetch_all(
         """
-        SELECT id, event_id, original_file_name, s3_object_key, thumbnail_s3_key, attempts
+        SELECT id, event_id, original_file_name, s3_object_key, thumbnail_s3_key, preview_s3_key, attempts
         FROM photos
         WHERE status = 'pending' AND s3_object_key IS NOT NULL AND attempts < ?
           AND (claimed_at IS NULL OR claimed_at < ?)
@@ -349,6 +353,7 @@ async def _process(photo: dict) -> None:
     ext = os.path.splitext(s3_key)[1].lstrip(".") or "jpg"
     local = os.path.join(settings.UPLOAD_ROOT, f"work-{photo_id}.{ext}")
     thumb_local = os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg")
+    preview_local = os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}-preview.jpg")
     try:
         # 1. Fetch the original that the browser uploaded to S3
         try:
@@ -358,14 +363,19 @@ async def _process(photo: dict) -> None:
             return await _fail(photo, f"Could not read original from S3: {type(e).__name__}: {e}", permanent=missing)
 
         # Events without face scan (selection only) never call Rekognition
-        event = await db.fetch_one("SELECT face_scan_enabled FROM events WHERE id = ?", (event_id,))
+        event = await db.fetch_one(
+            "SELECT face_scan_enabled, selection_enabled FROM events WHERE id = ?", (event_id,)
+        )
         face_scan = event is None or event["face_scan_enabled"] != 0
+        # The larger preview is only used when a client picks photos, and only made once per photo
+        want_preview = bool(event and event["selection_enabled"]) and not photo.get("preview_s3_key")
 
         # 2. Read the image once: size, thumbnail, and (for face scan) a JPEG copy sized for Rekognition.
         #    (A file that isn't a valid image will never succeed, so don't retry it.)
         try:
             prepared = await asyncio.to_thread(
-                thumbnail_service.prepare, local, thumb_local, ai_copy=face_scan
+                thumbnail_service.prepare, local, thumb_local,
+                ai_copy=face_scan, preview_path=preview_local if want_preview else None,
             )
         except Exception as e:
             return await _fail(photo, f"Image read failed: {type(e).__name__}: {e}", permanent=True)
@@ -389,6 +399,18 @@ async def _process(photo: dict) -> None:
             "UPDATE photos SET width = ?, height = ?, thumbnail_s3_key = ? WHERE id = ?",
             (prepared.width, prepared.height, thumb_key, photo_id),
         )
+
+        # 3b. Preview for client selection (same rules as the thumbnail: the queue retries a failure)
+        if want_preview:
+            preview_key = s3_preview_key(event_id, photo_id)
+            try:
+                await s3_service.upload_file(
+                    preview_local, preview_key, "image/jpeg",
+                    cache_control="private, max-age=31536000, immutable",
+                )
+            except Exception as e:
+                return await _fail(photo, f"Could not save the large preview to S3: {type(e).__name__}: {e}")
+            await db.execute("UPDATE photos SET preview_s3_key = ? WHERE id = ?", (preview_key, photo_id))
 
         # 4. Face indexing — only for events whose plan includes it, and skipped if faces are
         #    already stored, so a retry never duplicates them
@@ -433,3 +455,4 @@ async def _process(photo: dict) -> None:
     finally:
         remove_silently(local)
         remove_silently(thumb_local)
+        remove_silently(preview_local)

@@ -22,6 +22,9 @@ export function Navbar() {
         return () => cancelAnimationFrame(frame);
     }, []);
 
+    // A photographer's client choosing photos sees no sign-in or dashboard links
+    if (pathname.startsWith("/select/")) return null;
+
     if (!mounted) {
         return (
             <nav className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">

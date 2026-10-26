@@ -10,6 +10,10 @@ AI_MAX_EDGE = 3000
 AI_MAX_BYTES = 4_500_000
 _MIN_EDGE = 1000  # never shrink the Rekognition copy below this while chasing the size limit
 
+# The larger preview shown to a photographer's client when choosing photos: big enough to judge a
+# photo on a phone or laptop, small (a few hundred KB) compared with the original.
+PREVIEW_MAX_EDGE = 1600
+
 
 class PreparedImage(NamedTuple):
     width: int  # of the original, as it is displayed (EXIF rotation applied)
@@ -26,12 +30,17 @@ class ThumbnailService:
 
     @staticmethod
     def prepare(
-        image_path: str, thumb_path: str, thumb_size=(512, 512), ai_copy: bool = True
+        image_path: str,
+        thumb_path: str,
+        thumb_size=(512, 512),
+        ai_copy: bool = True,
+        preview_path: str | None = None,
     ) -> PreparedImage:
         """
         Read the photo once and produce everything the worker needs from it:
-        its displayed size, a thumbnail written to thumb_path, and (unless ai_copy is False,
-        for events without face scan) a JPEG copy for Rekognition.
+        its displayed size, a thumbnail written to thumb_path, a larger preview written to
+        preview_path (when given) and (unless ai_copy is False, for events without face scan)
+        a JPEG copy for Rekognition.
 
         EXIF rotation is applied, so portrait photos stay upright in the thumbnail and
         Rekognition sees them the right way up. Raises if the file isn't a readable image.
@@ -43,19 +52,28 @@ class ThumbnailService:
 
             # For JPEGs the decoder can shrink the image while reading it, which saves a lot of
             # time and memory on big files. It never goes below the size requested here.
-            scale = min(1.0, AI_MAX_EDGE / max(src.size))
+            # Events without face scan only need the preview size, which decodes even faster.
+            target_edge = AI_MAX_EDGE if ai_copy else PREVIEW_MAX_EDGE
+            scale = min(1.0, target_edge / max(src.size))
             src.draft("RGB", (max(1, round(src.size[0] * scale)), max(1, round(src.size[1] * scale))))
 
             work = ImageOps.exif_transpose(src)
             if work.mode != "RGB":
                 work = work.convert("RGB")
 
-        if max(work.size) > AI_MAX_EDGE:
-            work.thumbnail((AI_MAX_EDGE, AI_MAX_EDGE), Image.Resampling.LANCZOS)
+        if max(work.size) > target_edge:
+            work.thumbnail((target_edge, target_edge), Image.Resampling.LANCZOS)
 
         ai_jpeg = _encode_under_limit(work) if ai_copy else None
 
-        thumb = work.copy()
+        # Shrink step by step: the thumbnail is made from the preview, which is cheaper than from the original.
+        smaller = work
+        if preview_path:
+            smaller = work.copy()
+            smaller.thumbnail((PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE), Image.Resampling.LANCZOS)
+            smaller.save(preview_path, "JPEG", quality=80, optimize=True)
+
+        thumb = smaller.copy()
         thumb.thumbnail(thumb_size, Image.Resampling.LANCZOS)
         thumb.save(thumb_path, "JPEG", quality=85)
 

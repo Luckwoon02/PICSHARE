@@ -13,6 +13,7 @@ import { UploadPanel } from "@/components/dashboard/upload-panel";
 import { LiveModeCard } from "@/components/dashboard/live-mode-card";
 import { PhotoGrid, type Photo } from "@/components/dashboard/photo-grid";
 import { GuestsTable, type Guest } from "@/components/dashboard/guests-table";
+import { SelectionPanel } from "@/components/dashboard/selection-panel";
 
 interface Storage {
     capacity_bytes: number;
@@ -54,7 +55,7 @@ const finishedCount = (p: Progress | null) => (p ? p.processed + p.errors : 0);
 /** Changes whenever the gallery would look different: a photo arrived or one finished processing. */
 const progressSig = (p: Progress) => `${p.total}:${finishedCount(p)}`;
 
-type Tab = "photos" | "guests";
+type Tab = "photos" | "guests" | "selections";
 
 export default function EventDetailClient() {
     const { id } = useParams<{ id: string }>();
@@ -367,6 +368,10 @@ export default function EventDetailClient() {
 
     // Older servers don't send the plan fields: treat such events as face scan, which is what they always were
     const faceScan = event.face_scan_enabled !== false;
+    const selection = event.selection_enabled === true;
+    const tabs: Tab[] = ["photos", ...(faceScan ? (["guests"] as const) : []), ...(selection ? (["selections"] as const) : [])];
+    // The tab in use may not exist for this event (e.g. after switching events)
+    const activeTab: Tab = tabs.includes(tab) ? tab : "photos";
     const plan = planInfo(event.plan);
 
     const remaining = storage && event.storage_capacity_gb ? Math.max(storage.capacity_bytes - storage.used_bytes, 0) : null;
@@ -469,33 +474,37 @@ export default function EventDetailClient() {
             {/* Tabs */}
             <div className="space-y-6">
                 <div className="flex gap-1 border-b border-border" role="tablist">
-                    {(faceScan ? (["photos", "guests"] as const) : (["photos"] as const)).map((t) => (
+                    {tabs.map((t) => (
                         <button
                             key={t}
                             role="tab"
-                            aria-selected={tab === t}
+                            aria-selected={activeTab === t}
                             onClick={() => setTab(t)}
                             className={`px-4 py-2.5 text-sm font-semibold capitalize -mb-px border-b-2 transition-colors ${
-                                tab === t
+                                activeTab === t
                                     ? "border-indigo-600 text-indigo-600 dark:text-indigo-400"
                                     : "border-transparent text-muted-foreground hover:text-foreground"
                             }`}
                         >
                             {t}
-                            <span className="ml-2 text-xs rounded-full bg-muted px-2 py-0.5">
-                                {t === "photos" ? photos.length : guests.length}
-                            </span>
+                            {t !== "selections" && (
+                                <span className="ml-2 text-xs rounded-full bg-muted px-2 py-0.5">
+                                    {t === "photos" ? photos.length : guests.length}
+                                </span>
+                            )}
                         </button>
                     ))}
                 </div>
 
-                {tab === "photos" || !faceScan ? (
+                {activeTab === "selections" ? (
+                    <SelectionPanel eventId={id} eventName={event.name} />
+                ) : activeTab === "guests" ? (
+                    <GuestsTable guests={guests} loading={loadingGuests} onChanged={loadGuests} />
+                ) : (
                     <div className="space-y-6">
                         <UploadPanel eventId={id} remainingBytes={remaining} onUploaded={refreshAfterChange} />
                         <PhotoGrid eventId={id} photos={photos} loading={loadingPhotos} onChanged={refreshAfterChange} />
                     </div>
-                ) : (
-                    <GuestsTable guests={guests} loading={loadingGuests} onChanged={loadGuests} />
                 )}
             </div>
 

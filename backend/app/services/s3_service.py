@@ -102,6 +102,13 @@ class S3Service:
 
         return await asyncio.to_thread(_head)
 
+    def open_object(self, s3_key: str):
+        """
+        Open an S3 object for streaming (blocking: call from a worker thread, e.g. inside a sync
+        generator given to StreamingResponse). Read it with `.iter_chunks()`; close it when done.
+        """
+        return self._client.get_object(Bucket=self.bucket, Key=s3_key)["Body"]
+
     async def object_exists(self, s3_key: str) -> bool:
         """True if the key exists in the bucket."""
         def _head():

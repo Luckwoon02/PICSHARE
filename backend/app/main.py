@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import events, photos, guests, auth, payments
+from app.api import events, photos, guests, auth, payments, selection
 from app.services import live_ingest, photo_worker
 from app.services.db import connect_to_db, close_db_connection
 from app.core.config import get_settings
@@ -45,6 +45,8 @@ app.include_router(events.router)
 app.include_router(payments.router)
 app.include_router(photos.router)
 app.include_router(guests.router)
+app.include_router(selection.owner_router)
+app.include_router(selection.client_router)
 
 @app.get("/")
 def read_root():

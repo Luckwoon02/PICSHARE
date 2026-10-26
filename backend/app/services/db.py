@@ -87,6 +87,34 @@ class Database:
             )
         """)
 
+        # Photo selection: one link (+ code) per client, and the photos that client picked.
+        # A pick is just a row here, never a copy of the file.
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS selection_links (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                code TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                status TEXT DEFAULT 'open',
+                submitted_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (event_id) REFERENCES events (id)
+            )
+        """)
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS selections (
+                link_id TEXT NOT NULL,
+                photo_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (link_id, photo_id)
+            )
+        """)
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_selections_photo ON selections (photo_id)")
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_selection_links_event ON selection_links (event_id)")
+
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_event ON photos (event_id)")
         await self.connection.execute(
@@ -104,6 +132,7 @@ class Database:
         # Events created before payments existed default to 'active' / 'not_required'.
         for ddl in (
             "ALTER TABLE photos ADD COLUMN error_detail TEXT",
+            "ALTER TABLE photos ADD COLUMN preview_s3_key TEXT",
             "ALTER TABLE photos ADD COLUMN size_bytes INTEGER DEFAULT 0",
             "ALTER TABLE photos ADD COLUMN attempts INTEGER DEFAULT 0",
             "ALTER TABLE photos ADD COLUMN claimed_at TEXT",

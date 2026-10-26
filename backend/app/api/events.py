@@ -322,6 +322,10 @@ async def delete_event(event_id: str, user: dict = Depends(get_current_user)):
                     print(f"[delete_event] Could not remove selfie {selfie_path}: {e}")
 
         # --- DB cleanup (order respects FK constraints) ---
+        await db.execute(
+            "DELETE FROM selections WHERE link_id IN (SELECT id FROM selection_links WHERE event_id = ?)", (event_id,)
+        )
+        await db.execute("DELETE FROM selection_links WHERE event_id = ?", (event_id,))
         await db.execute("DELETE FROM faces WHERE event_id = ?", (event_id,))
         await db.execute("DELETE FROM photos WHERE event_id = ?", (event_id,))
         await db.execute("DELETE FROM guests WHERE event_id = ?", (event_id,))

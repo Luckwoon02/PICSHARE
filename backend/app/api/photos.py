@@ -474,7 +474,7 @@ async def purge_stuck_photos(event_id: str, user: dict = Depends(get_current_use
     await get_owned_event(event_id, user)
     rows = await db.fetch_all(
         """
-        SELECT id, s3_object_key, thumbnail_s3_key FROM photos
+        SELECT id, s3_object_key, thumbnail_s3_key, preview_s3_key FROM photos
         WHERE event_id = ?
           AND (status = 'error' OR (status = 'pending' AND s3_object_key IS NULL)
                OR (status = 'pending_upload' AND created_at < ?))
@@ -487,7 +487,7 @@ async def purge_stuck_photos(event_id: str, user: dict = Depends(get_current_use
     deleted = 0
     for row in rows:
         photo_id = row["id"]
-        for key in (row["s3_object_key"], row["thumbnail_s3_key"]):
+        for key in (row["s3_object_key"], row["thumbnail_s3_key"], row["preview_s3_key"]):
             if key:
                 try:
                     await s3_service.delete_object(key)
@@ -498,6 +498,7 @@ async def purge_stuck_photos(event_id: str, user: dict = Depends(get_current_use
             _remove_silently(os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}"))
         _remove_silently(os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg"))
         await db.execute("DELETE FROM faces WHERE photo_id = ?", (photo_id,))
+        await db.execute("DELETE FROM selections WHERE photo_id = ?", (photo_id,))
         await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
         deleted += 1
 
@@ -526,12 +527,15 @@ async def delete_photo(photo_id: str, user: dict = Depends(get_current_user)):
             await s3_service.delete_object(photo["s3_object_key"])
         if photo.get("thumbnail_s3_key"):
             await s3_service.delete_object(photo["thumbnail_s3_key"])
+        if photo.get("preview_s3_key"):
+            await s3_service.delete_object(photo["preview_s3_key"])
 
         for ext in ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG", "webp", "WEBP"]:
             _remove_silently(os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}"))
         _remove_silently(os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg"))
 
         await db.execute("DELETE FROM faces WHERE photo_id = ?", (photo_id,))
+        await db.execute("DELETE FROM selections WHERE photo_id = ?", (photo_id,))
         await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
 
         return {"message": "Photo deleted successfully"}
@@ -566,12 +570,15 @@ async def delete_photos_bulk(photo_ids: List[str], user: dict = Depends(get_curr
                 await s3_service.delete_object(photo["s3_object_key"])
             if photo.get("thumbnail_s3_key"):
                 await s3_service.delete_object(photo["thumbnail_s3_key"])
+            if photo.get("preview_s3_key"):
+                await s3_service.delete_object(photo["preview_s3_key"])
 
             for ext in ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG", "webp", "WEBP"]:
                 _remove_silently(os.path.join(settings.UPLOAD_ROOT, f"{photo_id}.{ext}"))
             _remove_silently(os.path.join(settings.THUMBNAIL_ROOT, f"{photo_id}.jpg"))
 
             await db.execute("DELETE FROM faces WHERE photo_id = ?", (photo_id,))
+            await db.execute("DELETE FROM selections WHERE photo_id = ?", (photo_id,))
             await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
             deleted_count += 1
         except Exception as e:
