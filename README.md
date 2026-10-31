@@ -1,155 +1,122 @@
-# 📸 PIXELLO | AI-Powered Event Photography
+<div align="center">
 
-**PIXELLO** is a full-stack event photo sharing platform that uses **AWS Rekognition** for cloud-based face matching and **AWS S3** for scalable photo storage. Admins upload event photos, and guests find all their pictures instantly by submitting a single selfie.
+# 📸 Pixello
 
-![Project Status](https://img.shields.io/badge/Status-Beta-orange)
+**Event photos, found by face.**
+Photographers upload an event once. Guests take a selfie and get back only the photos they're in.
 
-![Stack](https://img.shields.io/badge/Stack-FastAPI%20|%20Next.js%20|%20AWS%20Rekognition-green)
+![Status](https://img.shields.io/badge/status-beta-orange)
+![Backend](https://img.shields.io/badge/backend-FastAPI-009688)
+![Frontend](https://img.shields.io/badge/frontend-Next.js%2016-black)
+![AI](https://img.shields.io/badge/faces-AWS%20Rekognition-FF9900)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
----
-
-## ✨ Features
-
-- 👤 **AI Face Matching** — AWS Rekognition indexes every face in every event photo. Guests submit a selfie and get back a curated gallery of only their photos.
-- ☁️ **S3 Photo Storage** — Originals and thumbnails are stored in AWS S3; the backend streams presigned URLs directly to the browser so no files are ever proxied through the server.
-- 🚀 **FastAPI Backend** — Async Python backend with `aiosqlite` for non-blocking SQLite access.
-- 🎨 **Next.js 16 Frontend** — Responsive admin dashboard and guest portal with dark mode support, built with TailwindCSS v4 and Shadcn UI.
-- 📱 **Guest Self-Service Portal** — Guests upload a selfie via webcam or file picker and instantly receive their photo gallery.
-- 🛠️ **Admin Dashboard** — Create and manage events, upload photos in bulk, monitor processing status, and view per-event S3 storage usage.
-- 🔄 **Startup Recovery Worker** — `cron_worker.py` runs on container start to reset any photos or guests left in a stuck state from interrupted processing.
-- 🔐 **Protected Events** — Events can be secured with a secret code that guests must enter before accessing the portal.
-- 📦 **Docker Ready** — Single `docker-compose up` starts the entire stack.
+</div>
 
 ---
 
-## 🏗️ Architecture
+## Contents
 
-### Tech Stack
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Tech stack](#tech-stack)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Local development](#local-development)
+- [Project structure](#project-structure)
+- [API overview](#api-overview)
+- [Database](#database)
+- [Roadmap and known limits](#roadmap-and-known-limits)
+- [Contributing, security, license](#contributing-security-license)
+
+---
+
+## What it does
+
+**For guests**
+- 🤳 **Find my photos** — upload a selfie (webcam or file) and get a gallery of just your photos, matched with AWS Rekognition.
+- ⬇️ **Download** single photos, or everything you were matched in as one ZIP.
+- 🔒 **Protected events** — an event can require a secret code before the guest portal opens.
+
+**For photographers and event owners**
+- 🗂️ **Dashboard** — create events, upload photos in bulk, watch processing status, and see storage used against your plan.
+- ⚡ **Resilient uploads** — files go straight from the browser to S3 through presigned URLs, using a web worker, so the server never proxies photo bytes. Failed photos can be retried.
+- 🖼️ **Client photo selection** — send each client a private link and code. They pick favourites from previews (never originals), and you export the picks as a ZIP or a list of file names.
+- 📱 **QR cards** — generate a printable QR card that sends guests straight to the event page.
+- 💳 **Plans and checkout** — events are priced by storage (and optional add-ons). Checkout is simulated for now; see [Roadmap](#roadmap-and-known-limits).
+
+**Accounts**
+- Email and password sign-up with **email confirmation** and **password reset**.
+- **Continue with Google** (optional).
+- Sign-up and reset flows never reveal whether an email is already registered.
+- Login is rate-limited and tokens are typed, so a reset or verify token can't be used as a login token.
+
+---
+
+## How it works
+
+### Photo processing
+
+```
+Browser ── presigned PUT ──▶ S3  events/{event_id}/originals/{photo_id}.ext
+   │
+   └─ POST /photos/upload-complete ─▶ photo row (status = pending)
+                                          │
+                                  background photo worker
+                                          │
+              ┌───────────────────────────┼────────────────────────────┐
+              ▼                           ▼                            ▼
+     read dimensions            make thumbnail + preview      Rekognition IndexFaces
+        (Pillow)                  ─▶ S3 (thumbnails/)       (event's own collection)
+                                          │
+                                          ▼
+                  faces rows written, photo marked processed
+```
+
+- The worker lives inside the API process and claims jobs from the database. It has concurrency and retry limits (`PHOTO_WORKER_CONCURRENCY`, `REKOGNITION_MAX_TPS`).
+- **Run the API with a single Uvicorn worker.** The queue claims jobs without cross-process locking (the Dockerfile already does this).
+- `cron_worker.py` runs once on container start and resets photos or guests left stuck by an interrupted run.
+
+### Guest face match
+
+```
+Guest selfie ─▶ Rekognition SearchFacesByImage (event collection)
+            ─▶ matched photo ids, de-duplicated, best match first
+            ─▶ guest record updated
+            ─▶ gallery rendered with presigned S3 URLs
+```
+
+Each event gets its own Rekognition collection, so guests can only ever match inside the event they opened.
+
+---
+
+## Tech stack
 
 | Layer | Technology |
 |---|---|
-| **Backend** | Python 3.12, FastAPI, Uvicorn |
-| **Frontend** | Next.js 16, React 19, TailwindCSS v4, Shadcn UI |
-| **Database** | SQLite (via `aiosqlite`) |
-| **Face Recognition** | AWS Rekognition |
-| **File Storage** | AWS S3 |
-| **Auth** | JWT (`python-jose`), bcrypt (`passlib`) |
-| **Containerisation** | Docker & Docker Compose |
-| **Package Managers** | `pip` (backend), `bun 1.3.5` (frontend) |
-
-### Project Structure
-
-```text
-PIXELLO/
-├── backend/
-│   ├── app/
-│   │   ├── api/
-│   │   │   ├── auth.py           # JWT login/logout
-│   │   │   ├── events.py         # Event CRUD + storage stats
-│   │   │   ├── photos.py         # Upload, processing pipeline, gallery, download
-│   │   │   └── guests.py         # Selfie upload + face-match search
-│   │   ├── core/
-│   │   │   └── config.py         # Pydantic settings (reads .env)
-│   │   ├── services/
-│   │   │   ├── db.py             # aiosqlite connection + schema init
-│   │   │   ├── s3_service.py     # Upload, presigned URLs, delete, storage stats
-│   │   │   ├── rekognition_service.py  # Collection lifecycle, IndexFaces, SearchFacesByImage
-│   │   │   ├── thumbnail_service.py    # Pillow thumbnail generation
-│   │   │   └── recovery.py       # Stuck-record recovery logic
-│   │   └── main.py               # App entry point, CORS, router registration
-│   ├── cron_worker.py            # Startup recovery worker (run once, then exits)
-│   ├── reset_app.py              # Dev utility — wipes DB and local data dirs
-│   ├── requirements.txt
-│   ├── Dockerfile
-│   └── .env.example
-├── frontend/
-│   ├── src/
-│   │   ├── app/                  # Next.js App Router pages
-│   │   │   ├── page.tsx          # Landing / home
-│   │   │   ├── events/           # Public event listing
-│   │   │   ├── event/[slug]/     # Guest portal (selfie upload + gallery)
-│   │   │   │   └── guest/[guestId]/  # Per-guest photo gallery
-│   │   │   ├── login/ register/  # Account pages
-│   │   │   └── dashboard/        # Your events, create-event form, payment, event detail
-│   │   ├── components/           # UI components (client-side)
-│   │   └── lib/                  # Shared utilities
-│   ├── package.json
-│   ├── Dockerfile
-│   └── next.config.ts
-├── docker-compose.yml
-└── README.md
-```
-
-### Photo Processing Pipeline
-
-```
-Admin uploads photo(s)
-        │
-        ▼
-  Saved locally (staging)
-        │
-        ▼
-  Dimensions read (Pillow)
-        │
-        ▼
-  Original uploaded → S3  (events/{event_id}/originals/{photo_id}.ext)
-        │
-        ▼
-  Thumbnail generated (Pillow 512×512) → S3  (events/{event_id}/thumbnails/{photo_id}.jpg)
-        │
-        ▼
-  AWS Rekognition IndexFaces  (against the event's Rekognition Collection)
-        │
-        ▼
-  Face rows written to SQLite (faces table)
-        │
-        ▼
-  Photo record updated (status=processed, faces_count, s3 keys)
-        │
-        ▼
-  Local staging files deleted
-```
-
-### Guest Face-Match Flow
-
-```
-Guest submits selfie
-        │
-        ▼
-  Selfie saved to disk  (data/uploads/selfies/)
-        │
-        ▼
-  AWS Rekognition SearchFacesByImage  (searches the event's Collection)
-        │
-        ▼
-  Matched photo_ids returned (deduplicated, sorted by similarity)
-        │
-        ▼
-  Guest record updated with matched_photo_ids
-        │
-        ▼
-  Frontend renders gallery with presigned S3 URLs
-```
+| Backend | Python 3.12, FastAPI, Uvicorn |
+| Frontend | Next.js 16, React 19, Tailwind CSS v4, shadcn/ui |
+| Database | SQLite via `aiosqlite` |
+| Face recognition | AWS Rekognition |
+| File storage | AWS S3 |
+| Auth | JWT, bcrypt, optional Google OAuth 2.0 |
+| Email | Any SMTP server (printed to the console if none is set) |
+| Packaging | Docker and Docker Compose; `pip` (backend), `bun` (frontend) |
 
 ---
 
-## ⚡ Quick Start
+## Quick start
 
 ### Prerequisites
 
-| Requirement | Notes |
+| Need | Why |
 |---|---|
-| **Docker & Docker Compose** | Recommended for running the full stack |
-| **AWS Account** | Free-tier eligible for small usage |
-| **AWS S3 Bucket** | For photo and thumbnail storage |
-| **AWS Rekognition** | For face indexing and search |
-| **IAM credentials** | See IAM permissions below |
-| **Python 3.12+** | For local development only |
-| **Bun 1.3.5+** | For local frontend development only |
+| Docker and Docker Compose | Runs the whole stack |
+| An AWS account, an S3 bucket, and an IAM user | Photo storage and face matching |
+| Python 3.12+ and Bun 1.3+ | Only for [local development](#local-development) |
 
-#### Required IAM Permissions
-
-Create an IAM user or role and attach a policy with at minimum:
+<details>
+<summary><b>Minimum IAM policy</b></summary>
 
 ```json
 {
@@ -178,173 +145,249 @@ Create an IAM user or role and attach a policy with at minimum:
 }
 ```
 
----
+</details>
 
-### 1. Configure Environment
+Browsers upload straight to S3, so the bucket also needs a CORS rule for your frontend's origin. `backend/set_s3_cors.py` sets one up.
 
-Copy the example file and fill in your values:
+### 1. Create `backend/.env`
 
-```bash
-cp backend/.env.example backend/.env
+At minimum:
+
+```env
+SECRET_KEY=<32+ random characters>
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+S3_BUCKET_NAME=your-bucket
 ```
 
-| Variable | Description | Default |
-|---|---|---|
-| `SECRET_KEY` | Required, 32+ characters. Signs JWT tokens. Generate with `python -c "import secrets; print(secrets.token_hex(32))"` | *(none, the app won't start without it)* |
-| `ALGORITHM` | JWT signing algorithm | `HS256` |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime in minutes | `1440` (24 h) |
-| `FRONTEND_URL` | Where the links in emails (confirm account, reset password) point | `http://localhost:3000` |
-| `SMTP_HOST` | Mail server for those emails. **Empty = emails are printed to the backend console instead of sent**, handy locally, never for production | *(empty)* |
-| `SMTP_PORT` | Mail server port | `587` |
-| `SMTP_USERNAME` / `SMTP_PASSWORD` | Mail server login (leave empty if it needs none) | *(empty)* |
-| `SMTP_USE_SSL` | `true` = TLS from the start (usually port 465); `false` = STARTTLS | `false` |
-| `EMAIL_FROM` | Sender shown on those emails | `Pixello <no-reply@localhost>` |
-| `EMAIL_VERIFY_EXPIRE_HOURS` | How long the confirm-your-email link works | `24` |
-| `PASSWORD_RESET_EXPIRE_MINUTES` | How long the reset-password link works | `60` |
-| `AWS_ACCESS_KEY_ID` | AWS IAM access key | *(required)* |
-| `AWS_SECRET_ACCESS_KEY` | AWS IAM secret key | *(required)* |
-| `AWS_REGION` | AWS region for S3 and Rekognition | `us-east-1` |
-| `S3_BUCKET_NAME` | S3 bucket to store photos | *(required)* |
-| `REKOGNITION_FACE_MATCH_THRESHOLD` | Minimum match confidence (0–100) | `80.0` |
-| `REKOGNITION_MAX_TPS` | Max face-indexing calls per second. AWS's default quota is 50 in us-east-1, us-west-2 and eu-west-1 and 5 elsewhere | `5` |
-| `PHOTO_WORKER_CONCURRENCY` | Photos processed at once by the background worker (each decodes a full-size image, so keep it low on a laptop) | `4` |
-| `PAYMENT_REQUIRED` | If `false`, event owners can skip checkout (dev/testing). Set `true` in production | `false` |
-| `PAYMENT_PROVIDER` | Payment gateway; only `mock` (simulated checkout) is implemented | `mock` |
-| `PRICE_PER_GB_CENTS` | Event price per GB of storage, in cents | `100` |
-| `PRICE_FACE_SCAN_CENTS` / `PRICE_SELECTION_CENTS` | Flat per-event add-on, in cents, when the event's plan includes face scan / photo selection. `0` = included in the storage price | `0` / `0` |
-| `MIN_STORAGE_GB` / `MAX_STORAGE_GB` | Allowed storage range when creating an event | `1` / `1000` |
-| `DB_PATH` | Path to SQLite database file | `data/app.db` |
-| `UPLOAD_ROOT` | Local staging dir for originals | `data/uploads/originals` |
-| `THUMBNAIL_ROOT` | Local staging dir for thumbnails | `data/thumbnails` |
-| `GUEST_SELFIES_DIR` | Local dir for guest selfies | `data/uploads/selfies` |
+Generate a key with:
 
-> **Security note:** Use a different `SECRET_KEY` in production than in development. Changing it logs everyone out and invalidates client selection sessions.
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
 
----
+Everything else has a default. See [Configuration](#configuration).
 
-### 2. Run with Docker 🐳
+### 2. Start the stack
 
 ```bash
 docker-compose up -d
 ```
 
-Docker Compose starts two services:
-
-| Service | Container | Port |
+| Service | Container | URL |
 |---|---|---|
-| FastAPI backend | `pixello-backend` | `8000` |
-| Next.js frontend | `pixello-frontend` | `3005` |
+| Frontend | `pixello-frontend` | http://localhost:3005 |
+| Backend API | `pixello-backend` | http://localhost:8000 |
+| Interactive API docs | | http://localhost:8000/docs |
 
-Access points:
+The `data/` folder is mounted into the backend container, so the SQLite database and staging files survive restarts.
 
-- **Frontend**: [http://localhost:3005](http://localhost:3005)
-- **Admin dashboard**: [http://localhost:3005/admin/login](http://localhost:3005/admin/login)
-- **Backend API**: [http://localhost:8000](http://localhost:8000)
-- **Swagger / OpenAPI docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+### 3. Try it
 
-The `data/` directory is bind-mounted from the project root into `/app/data` inside the container, so the SQLite database and any temporary staging files persist across restarts.
+1. Open http://localhost:3005 and **register**. With no `SMTP_HOST` set, the confirmation link is printed in the backend logs (`docker logs pixello-backend`).
+2. Create an event, upload some photos, and wait for them to show as processed.
+3. Open the event's public page, submit a selfie, and see your matches.
 
 ---
 
-## 🛠️ Local Development
+## Configuration
+
+All backend settings are environment variables, read from `backend/.env`. Defaults are in [backend/app/core/config.py](backend/app/core/config.py).
+
+### Core and auth
+
+| Variable | Description | Default |
+|---|---|---|
+| `SECRET_KEY` | **Required**, 32+ characters. Signs JWTs. Changing it logs everyone out and invalidates client selection sessions. | none (app won't start) |
+| `ALGORITHM` | JWT algorithm | `HS256` |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | Login token lifetime | `1440` |
+| `FRONTEND_URL` | Used for links in emails and for the CORS origin | `http://localhost:3000` |
+
+### Email
+
+| Variable | Description | Default |
+|---|---|---|
+| `SMTP_HOST` | Mail server. **Empty means emails are printed to the backend console** (fine locally, not for real users). | empty |
+| `SMTP_PORT` | Mail server port | `587` |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | Mail login, if the server needs one | empty |
+| `SMTP_USE_SSL` | `true` = TLS from the start (usually port 465); `false` = STARTTLS | `false` |
+| `EMAIL_FROM` | Sender shown on emails | `Pixello <no-reply@localhost>` |
+| `EMAIL_VERIFY_EXPIRE_HOURS` | How long the confirmation link works | `24` |
+| `PASSWORD_RESET_EXPIRE_MINUTES` | How long the reset link works | `60` |
+
+### Sign in with Google (optional)
+
+| Variable | Description | Default |
+|---|---|---|
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | From Google Cloud Console → APIs & Services → Credentials → OAuth client ID → Web application. Empty hides the button. | empty |
+| `GOOGLE_REDIRECT_URI` | The API's `/auth/google/callback` as the browser reaches it (behind the frontend proxy: `https://your-site/api/auth/google/callback`). Add the same URL under *Authorized redirect URIs*. | `http://localhost:8000/auth/google/callback` |
+
+### AWS and processing
+
+| Variable | Description | Default |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | IAM credentials | required |
+| `AWS_REGION` | Region for S3 and Rekognition | `us-east-1` |
+| `S3_BUCKET_NAME` | Bucket for photos and thumbnails | required |
+| `REKOGNITION_FACE_MATCH_THRESHOLD` | Minimum match confidence, 0–100 | `80.0` |
+| `REKOGNITION_MAX_TPS` | Max IndexFaces calls per second. AWS's default quota is 50 in us-east-1, us-west-2 and eu-west-1, and 5 elsewhere. | `5` |
+| `PHOTO_WORKER_CONCURRENCY` | Photos processed at once. Each decodes a full-size image, so keep it low on a laptop. | `4` |
+
+### Payments and pricing
+
+| Variable | Description | Default |
+|---|---|---|
+| `PAYMENT_REQUIRED` | If `false`, owners can skip checkout (dev only) | `false` |
+| `PAYMENT_PROVIDER` | Only `mock` (simulated checkout) exists today | `mock` |
+| `PAYMENT_CURRENCY` | Currency code | `usd` |
+| `PRICE_PER_GB_CENTS` | Price per GB of event storage, in cents | `100` |
+| `PRICE_FACE_SCAN_CENTS` / `PRICE_SELECTION_CENTS` | Flat per-event add-on, in cents. `0` = included. | `0` / `0` |
+| `MIN_STORAGE_GB` / `MAX_STORAGE_GB` | Allowed storage when creating an event | `1` / `1000` |
+
+### Paths and live mode
+
+| Variable | Description | Default |
+|---|---|---|
+| `DB_PATH` | SQLite file | `data/app.db` |
+| `UPLOAD_ROOT` | Local staging for originals | `data/uploads/originals` |
+| `THUMBNAIL_ROOT` | Local staging for thumbnails | `data/thumbnails` |
+| `GUEST_SELFIES_DIR` | Guest selfies | `data/uploads/selfies` |
+| `INGEST_QUEUE_URL`, `LIVE_POLL_SECONDS`, `LIVE_SAFETY_SCAN_SECONDS` | Live-mode settings (see [limits](#roadmap-and-known-limits)) | empty / `15` / `300` |
+
+### Frontend
+
+The frontend reads one variable, `NEXT_PUBLIC_API_URL`. In Docker it is `/api` (a proxy to the backend). For local development set it to `http://localhost:8000`.
+
+---
+
+## Local development
 
 ### Backend
 
 ```bash
 cd backend
-
-# Create and activate a virtual environment
 python -m venv venv
-.\venv\Scripts\activate      # Windows
-# source venv/bin/activate   # macOS / Linux
+.\venv\Scripts\activate        # Windows
+# source venv/bin/activate     # macOS / Linux
 
-# Install dependencies
 pip install -r requirements.txt
-
-# Copy and edit environment variables
-cp .env.example .env
-
-# Start the API server (auto-reload on file changes)
 uvicorn app.main:app --reload
 ```
 
-The API will be available at `http://localhost:8000`.
-
-Run the recovery worker separately if needed:
+The API runs at http://localhost:8000. To run the stuck-record recovery pass by hand:
 
 ```bash
 python cron_worker.py
 ```
+
+`reset_app.py` wipes the local database and data folders. It is a development utility, so use it carefully.
 
 ### Frontend
 
 ```bash
 cd frontend
 bun install
+echo NEXT_PUBLIC_API_URL=http://localhost:8000 > .env.local
 bun run dev
 ```
 
-The frontend will be available at `http://localhost:3000`.
-
-> For local dev, create `frontend/.env.local` with:
-> ```
-> NEXT_PUBLIC_API_URL=http://localhost:8000
-> ```
+The app runs at http://localhost:3000, matching the default `FRONTEND_URL`.
 
 ---
 
-## � Python Dependencies
+## Project structure
 
-```
-fastapi              # Web framework
-uvicorn              # ASGI server
-python-multipart     # Multipart file upload parsing
-pillow               # Image processing & thumbnail generation
-python-dotenv        # .env file loading
-pydantic-settings    # Settings management via environment variables
-uuid                 # UUID generation
-requests             # HTTP client
-pyjwt                # JWT encoding/decoding
-passlib[bcrypt]      # Password hashing
-python-jose[cryptography]  # JWT with cryptography backend
-aiosqlite            # Async SQLite driver
-boto3==1.34.131      # AWS SDK — S3 and Rekognition (pinned)
+```text
+PICSHARE/
+├── backend/
+│   ├── app/
+│   │   ├── api/
+│   │   │   ├── auth.py        # register, login, verify email, password reset
+│   │   │   ├── oauth.py       # Sign in with Google
+│   │   │   ├── events.py      # event CRUD, public listing, storage stats
+│   │   │   ├── photos.py      # presigned uploads, status, gallery, delete, download
+│   │   │   ├── guests.py      # selfie requests, matches, ZIP download
+│   │   │   ├── selection.py   # client photo-selection links and picks
+│   │   │   └── payments.py    # checkout, confirm, skip
+│   │   ├── core/config.py     # settings (reads .env)
+│   │   ├── services/
+│   │   │   ├── db.py                   # SQLite connection, schema, migrations
+│   │   │   ├── photo_worker.py         # background processing queue
+│   │   │   ├── rekognition_service.py  # collections, IndexFaces, SearchFaces
+│   │   │   ├── s3_service.py           # presigned URLs, delete, storage size
+│   │   │   ├── thumbnail_service.py    # thumbnails and previews
+│   │   │   ├── email_service.py        # SMTP or console output
+│   │   │   ├── payment_service.py      # payment provider hook (mock)
+│   │   │   ├── live_ingest.py          # FTP/SFTP live mode (switched off)
+│   │   │   └── recovery.py             # reset stuck photos and guests
+│   │   └── main.py            # app, CORS, routers, worker lifecycle
+│   ├── cron_worker.py         # one-shot recovery on container start
+│   ├── set_s3_cors.py         # configure bucket CORS for browser uploads
+│   ├── setup_live_ingest.py   # SQS setup for live mode
+│   └── Dockerfile
+├── frontend/
+│   └── src/
+│       ├── app/               # App Router pages
+│       │   ├── dashboard/     # events, new event, payment, event detail
+│       │   ├── event/[slug]/  # guest portal and gallery
+│       │   ├── select/[token] # client photo selection
+│       │   ├── login, register, forgot-password, reset-password, verify-email, oauth/
+│       │   └── events/        # public event listing
+│       ├── components/        # UI, dashboard, auth and gallery components
+│       └── lib/               # API client, upload engine and worker, QR card, auth hook
+├── docker-compose.yml
+├── CONTRIBUTING.md
+└── SECURITY.md
 ```
 
 ---
 
-## 🗄️ Database Schema
+## API overview
 
-SQLite, auto-created on first startup at `DB_PATH`.
+Full, interactive docs are at `/docs` on the running backend.
 
-| Table | Purpose |
+| Prefix | Purpose |
 |---|---|
-| `events` | Event records (name, slug, date, optional secret code, sync status) |
-| `photos` | Photo records per event (S3 keys, dimensions, face count, status) |
-| `faces` | Individual face records per photo (Rekognition face ID) |
-| `guests` | Guest records per event (selfie path, match results, status) |
+| `/auth` | Register, login, email verification, password reset, `/me`, Google sign-in |
+| `/events` | Event CRUD, public listing and lookup, secret-code check, storage usage |
+| `/photos` | Upload URLs and completion, status, gallery, retry, delete (single and bulk), original, thumbnail and download URLs |
+| `/guests` | Selfie request, status polling, matches, ZIP download, delete |
+| `/selection` | Owner side: create and manage client selection links, export picks |
+| `/select` | Client side: enter code, browse previews, pick, submit |
+| `/payments` | Pricing config, checkout, confirm, skip |
 
 ---
 
-## 🔌 API Overview
+## Database
 
-All endpoints are documented interactively at `/docs`.
+SQLite, created automatically on first start at `DB_PATH`. New columns are added by small startup migrations in [backend/app/services/db.py](backend/app/services/db.py).
 
-| Prefix | Tag | Description |
-|---|---|---|
-| `/auth` | auth | Admin login, token refresh |
-| `/events` | events | CRUD for events, storage stats, public listing |
-| `/photos` | photos | Bulk upload, gallery, thumbnails, originals, download, delete |
-| `/guests` | guests | Selfie submission, face-match results, guest gallery |
-
----
-
-## 🔐 Security & License
-
-- **Security**: See [SECURITY.md](SECURITY.md) for vulnerability reporting guidelines.
-- **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
-- **License**: Distributed under the **MIT License**.
+| Table | Holds |
+|---|---|
+| `users`, `auth_tokens`, `oauth_identities` | Accounts, email and reset tokens, linked Google identities |
+| `events` | Event details, owner, plan, storage, payment status, optional secret code |
+| `photos` | S3 keys, dimensions, face count, processing status, retries |
+| `faces` | Rekognition face id per detected face |
+| `guests` | Guest requests, selfie path, match results |
+| `selection_links`, `selections` | Client selection links and the photos each client picked |
 
 ---
 
-**Built by Kaushik Ghosh with ❤️**
+## Roadmap and known limits
+
+- **Payments are simulated.** Only the `mock` provider exists. A real gateway (for example Stripe) plugs into `app/services/payment_service.py`.
+- **Live mode is switched off.** The code that pulls camera photos from FTP/SFTP through S3 and SQS is written but disabled in `main.py` until it is finished.
+- **Google sign-in is untested against real Google.** It has only been exercised against a fake. Before relying on it, test it with real credentials and a matching redirect URI.
+- **No automated tests or CI yet.**
+
+The full list of what's done, in progress and still to do is in [CHANGELOG.md](CHANGELOG.md).
+- **SQLite and a single API worker** suit small deployments. Scaling past that means a different database and an external job queue.
+
+---
+
+## Contributing, security, license
+
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Reporting vulnerabilities: [SECURITY.md](SECURITY.md)
+- License: MIT
