@@ -2,10 +2,11 @@ import hashlib
 import hmac
 import os
 import re
+import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
@@ -20,6 +21,46 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PBKDF2_ITERATIONS = 310_000
+
+# Marks a token as a login token, so a selection or download token can never be used to log in.
+TOKEN_TYPE = "access"
+
+# Attempts allowed per window, in seconds.
+WINDOW_SECONDS = 15 * 60
+MAX_FAILED_LOGINS_PER_EMAIL = 5
+MAX_FAILED_LOGINS_PER_IP = 30
+MAX_REGISTRATIONS_PER_IP = 10
+
+# Kept in memory, so it resets on restart and is per worker. Fine for one process; use Redis if
+# the API ever runs on several.
+_attempts: dict[str, list[float]] = {}
+
+
+def _recent(key: str) -> list[float]:
+    cutoff = time.monotonic() - WINDOW_SECONDS
+    recent = [t for t in _attempts.get(key, []) if t > cutoff]
+    if recent:
+        _attempts[key] = recent
+    else:
+        _attempts.pop(key, None)
+    return recent
+
+
+def _check_limit(key: str, limit: int) -> None:
+    if len(_recent(key)) >= limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many attempts. Try again in a few minutes.",
+        )
+
+
+def _record(key: str) -> None:
+    _attempts[key] = _recent(key) + [time.monotonic()]
+
+
+def _client_ip(request: Request) -> str:
+    # Behind a reverse proxy this is the proxy's address unless uvicorn runs with --proxy-headers.
+    return request.client.host if request.client else "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +116,9 @@ class AuthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def create_access_token(user_id: str) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     return jwt.encode(
-        {"sub": user_id, "exp": expire},
+        {"sub": user_id, "typ": TOKEN_TYPE, "exp": expire},
         settings.SECRET_KEY,
         algorithm=settings.ALGORITHM,
     )
@@ -108,7 +149,7 @@ async def get_current_user(
         user_id = payload.get("sub")
     except JWTError:
         raise credentials_exception
-    if not user_id:
+    if payload.get("typ") != TOKEN_TYPE or not user_id:
         raise credentials_exception
 
     user = await db.fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
@@ -122,7 +163,11 @@ async def get_current_user(
 # ---------------------------------------------------------------------------
 
 @router.post("/register", response_model=AuthResponse, status_code=201)
-async def register(data: RegisterRequest):
+async def register(data: RegisterRequest, request: Request):
+    ip_key = f"register:{_client_ip(request)}"
+    _check_limit(ip_key, MAX_REGISTRATIONS_PER_IP)
+    _record(ip_key)
+
     email = data.email.strip().lower()
     if not EMAIL_RE.match(email):
         raise HTTPException(status_code=422, detail="Enter a valid email address")
@@ -144,16 +189,23 @@ async def register(data: RegisterRequest):
 
 
 @router.post("/login", response_model=AuthResponse)
-async def login(data: LoginRequest):
-    user = await db.fetch_one(
-        "SELECT * FROM users WHERE email = ?", (data.email.strip().lower(),)
-    )
+async def login(data: LoginRequest, request: Request):
+    email = data.email.strip().lower()
+    email_key = f"login-email:{email}"
+    ip_key = f"login-ip:{_client_ip(request)}"
+    _check_limit(email_key, MAX_FAILED_LOGINS_PER_EMAIL)
+    _check_limit(ip_key, MAX_FAILED_LOGINS_PER_IP)
+
+    user = await db.fetch_one("SELECT * FROM users WHERE email = ?", (email,))
     if not user or not verify_password(data.password, user["password_hash"]):
+        _record(email_key)
+        _record(ip_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    _attempts.pop(email_key, None)
     return _auth_response(user)
 
 

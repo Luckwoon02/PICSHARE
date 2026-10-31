@@ -190,7 +190,7 @@ cp backend/.env.example backend/.env
 
 | Variable | Description | Default |
 |---|---|---|
-| `SECRET_KEY` | Long random string used to sign JWT tokens | `ThisIsMyLongSecretKeyForJWT` |
+| `SECRET_KEY` | Required, 32+ characters. Signs JWT tokens. Generate with `python -c "import secrets; print(secrets.token_hex(32))"` | *(none, the app won't start without it)* |
 | `ALGORITHM` | JWT signing algorithm | `HS256` |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime in minutes | `1440` (24 h) |
 | `AWS_ACCESS_KEY_ID` | AWS IAM access key | *(required)* |
@@ -210,7 +210,7 @@ cp backend/.env.example backend/.env
 | `THUMBNAIL_ROOT` | Local staging dir for thumbnails | `data/thumbnails` |
 | `GUEST_SELFIES_DIR` | Local dir for guest selfies | `data/uploads/selfies` |
 
-> **Security note:** Change `SECRET_KEY` before any production deployment.
+> **Security note:** Use a different `SECRET_KEY` in production than in development. Changing it logs everyone out and invalidates client selection sessions.
 
 ---
 
