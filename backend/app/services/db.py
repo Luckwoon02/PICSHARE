@@ -28,6 +28,20 @@ class Database:
             )
         """)
 
+        # Single-use links emailed to users (confirm email, reset password). Only a hash of the
+        # token is stored, so a leaked database can't be used to take over accounts.
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                token_hash TEXT UNIQUE NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        """)
+
         await self.connection.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
@@ -161,8 +175,26 @@ class Database:
             except Exception:
                 pass  # Column already exists — nothing to do
 
+        # Email verification. Accounts that existed before it was added are treated as verified:
+        # the UPDATE runs only on the startup that adds the column, never again.
+        try:
+            await self.connection.execute("ALTER TABLE users ADD COLUMN email_verified_at TEXT")
+            await self.connection.execute(
+                "UPDATE users SET email_verified_at = created_at WHERE email_verified_at IS NULL")
+            await self.connection.commit()
+        except Exception:
+            pass  # Column already exists — nothing to do
+        # Unix seconds. Login tokens issued before this moment stop working (see auth.get_current_user).
+        try:
+            await self.connection.execute("ALTER TABLE users ADD COLUMN password_changed_at INTEGER")
+            await self.connection.commit()
+        except Exception:
+            pass
+
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_owner ON events (owner_id)")
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens (user_id, purpose)")
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_status ON photos (status)")
         await self.connection.commit()

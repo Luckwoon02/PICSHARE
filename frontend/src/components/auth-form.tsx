@@ -3,12 +3,12 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Camera, Eye, EyeOff, Loader2, Lock, Mail, ScanFace, ShieldCheck, User as UserIcon, Zap } from "lucide-react";
+import { Camera, Eye, EyeOff, Loader2, Lock, Mail, MailCheck, ScanFace, ShieldCheck, User as UserIcon, Zap } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api, getToken, setToken, type User } from "@/lib/api";
+import { api, ApiError, getToken, setToken, type User } from "@/lib/api";
 
 type Mode = "login" | "register";
 
@@ -46,15 +46,28 @@ export default function AuthForm({ mode }: { mode: Mode }) {
     const [loading, setLoading] = useState(false);
     const [showPassword, setShowPassword] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    // The email a confirmation link was just sent to (register), or that still needs confirming (login)
+    const [sentTo, setSentTo] = useState<string | null>(null);
+    const [unconfirmedEmail, setUnconfirmedEmail] = useState<string | null>(null);
 
     // Already signed in → straight to the dashboard
     useEffect(() => {
         if (getToken()) router.replace("/dashboard");
     }, [router]);
 
+    const resend = async (email: string) => {
+        try {
+            await api("/auth/resend-verification", { method: "POST", body: JSON.stringify({ email }) });
+            toast.success("If that account still needs confirming, a new link is on its way.");
+        } catch (err) {
+            toast.error(err instanceof Error ? err.message : "Something went wrong");
+        }
+    };
+
     const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         setError(null);
+        setUnconfirmedEmail(null);
         const fd = new FormData(e.currentTarget);
         const email = String(fd.get("email") ?? "");
         const password = String(fd.get("password") ?? "");
@@ -66,19 +79,25 @@ export default function AuthForm({ mode }: { mode: Mode }) {
 
         setLoading(true);
         try {
-            const payload =
-                mode === "register"
-                    ? { name: String(fd.get("name") ?? ""), email, password }
-                    : { email, password };
-            const data = await api<{ access_token: string; user: User }>(`/auth/${mode}`, {
+            if (mode === "register") {
+                // No login yet: the account is usable once the emailed link has been opened.
+                await api("/auth/register", {
+                    method: "POST",
+                    body: JSON.stringify({ name: String(fd.get("name") ?? ""), email, password }),
+                });
+                setSentTo(email);
+                return;
+            }
+            const data = await api<{ access_token: string; user: User }>("/auth/login", {
                 method: "POST",
-                body: JSON.stringify(payload),
+                body: JSON.stringify({ email, password }),
             });
             setToken(data.access_token);
-            toast.success(mode === "register" ? "Account created — welcome!" : "Welcome back!");
+            toast.success("Welcome back!");
             router.push("/dashboard");
         } catch (err) {
             setError(err instanceof Error ? err.message : "Something went wrong");
+            if (err instanceof ApiError && err.status === 403) setUnconfirmedEmail(email);
         } finally {
             setLoading(false);
         }
@@ -113,6 +132,29 @@ export default function AuthForm({ mode }: { mode: Mode }) {
             {/* Form */}
             <div className="flex items-center justify-center px-4 py-12">
                 <div className="w-full max-w-sm space-y-8">
+                    {sentTo ? (
+                        <div className="space-y-4 text-center">
+                            <span className="mx-auto w-12 h-12 rounded-2xl bg-indigo-600/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center">
+                                <MailCheck className="w-6 h-6" />
+                            </span>
+                            <h1 className="text-3xl font-bold tracking-tight">Check your email</h1>
+                            <p className="text-muted-foreground">
+                                If <span className="font-medium text-foreground">{sentTo}</span> can be used for a new account, we&apos;ve
+                                sent a link to confirm it. Open the link to finish signing up.
+                            </p>
+                            <p className="text-sm text-muted-foreground">
+                                Nothing there?{" "}
+                                <button
+                                    type="button"
+                                    onClick={() => resend(sentTo)}
+                                    className="font-semibold text-indigo-600 dark:text-indigo-400 hover:underline"
+                                >
+                                    Send it again
+                                </button>
+                            </p>
+                        </div>
+                    ) : (
+                    <>
                     <div className="space-y-2">
                         <h1 className="text-3xl font-bold tracking-tight">{copy.title}</h1>
                         <p className="text-muted-foreground">{copy.subtitle}</p>
@@ -147,6 +189,13 @@ export default function AuthForm({ mode }: { mode: Mode }) {
                                 {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                             </button>
                         </Field>
+                        {mode === "login" && (
+                            <div className="text-right -mt-2">
+                                <Link href="/forgot-password" className="text-sm font-medium text-indigo-600 dark:text-indigo-400 hover:underline">
+                                    Forgot password?
+                                </Link>
+                            </div>
+                        )}
                         {mode === "register" && (
                             <Field id="confirm" label="Confirm password" icon={Lock}>
                                 <Input id="confirm" name="confirm" type={showPassword ? "text" : "password"} required autoComplete="new-password" className="pl-10 h-11" />
@@ -156,6 +205,18 @@ export default function AuthForm({ mode }: { mode: Mode }) {
                         {error && (
                             <p role="alert" className="text-sm text-destructive bg-destructive/10 border border-destructive/20 rounded-lg px-3 py-2">
                                 {error}
+                                {unconfirmedEmail && (
+                                    <>
+                                        {" "}
+                                        <button
+                                            type="button"
+                                            onClick={() => resend(unconfirmedEmail)}
+                                            className="font-semibold underline"
+                                        >
+                                            Send the link again
+                                        </button>
+                                    </>
+                                )}
                             </p>
                         )}
 
@@ -175,6 +236,8 @@ export default function AuthForm({ mode }: { mode: Mode }) {
                             {copy.switchLink}
                         </Link>
                     </p>
+                    </>
+                    )}
                 </div>
             </div>
         </div>

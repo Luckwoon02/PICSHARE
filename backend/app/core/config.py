@@ -11,6 +11,20 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
 
+    # --- Email (verification and password reset) ---
+    # Where the links in those emails point.
+    FRONTEND_URL: str = "http://localhost:3000"
+    # Empty SMTP_HOST = no mail server: emails are printed to the backend console instead, so
+    # you can copy the link while developing. Set it in production (any SMTP service, e.g. SES).
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_USE_SSL: bool = False  # True = TLS from the start (usually port 465); False = STARTTLS
+    EMAIL_FROM: str = "Pixello <no-reply@localhost>"
+    EMAIL_VERIFY_EXPIRE_HOURS: int = 24
+    PASSWORD_RESET_EXPIRE_MINUTES: int = 60
+
     # --- AWS ---
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""

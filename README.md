@@ -193,6 +193,14 @@ cp backend/.env.example backend/.env
 | `SECRET_KEY` | Required, 32+ characters. Signs JWT tokens. Generate with `python -c "import secrets; print(secrets.token_hex(32))"` | *(none, the app won't start without it)* |
 | `ALGORITHM` | JWT signing algorithm | `HS256` |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime in minutes | `1440` (24 h) |
+| `FRONTEND_URL` | Where the links in emails (confirm account, reset password) point | `http://localhost:3000` |
+| `SMTP_HOST` | Mail server for those emails. **Empty = emails are printed to the backend console instead of sent**, handy locally, never for production | *(empty)* |
+| `SMTP_PORT` | Mail server port | `587` |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | Mail server login (leave empty if it needs none) | *(empty)* |
+| `SMTP_USE_SSL` | `true` = TLS from the start (usually port 465); `false` = STARTTLS | `false` |
+| `EMAIL_FROM` | Sender shown on those emails | `Pixello <no-reply@localhost>` |
+| `EMAIL_VERIFY_EXPIRE_HOURS` | How long the confirm-your-email link works | `24` |
+| `PASSWORD_RESET_EXPIRE_MINUTES` | How long the reset-password link works | `60` |
 | `AWS_ACCESS_KEY_ID` | AWS IAM access key | *(required)* |
 | `AWS_SECRET_ACCESS_KEY` | AWS IAM secret key | *(required)* |
 | `AWS_REGION` | AWS region for S3 and Rekognition | `us-east-1` |
