@@ -164,6 +164,55 @@ export function ResetPasswordForm() {
     );
 }
 
+const OAUTH_ERRORS: Record<string, string> = {
+    cancelled: "Sign-in was cancelled.",
+    unverified_email: "Google couldn't confirm that email address, so we can't sign you in with it.",
+    expired: "That sign-in took too long or was started in another browser. Please try again.",
+    failed: "Google sign-in didn't work. Please try again.",
+};
+
+/** Where the server sends the browser back to after Google. It carries a one-time code, or an error. */
+export function OAuthCallback() {
+    const router = useRouter();
+    const params = useSearchParams();
+    const code = params.get("code") ?? "";
+    const errorKey = params.get("error");
+    const [error, setError] = useState<string | null>(
+        errorKey ? (OAUTH_ERRORS[errorKey] ?? OAUTH_ERRORS.failed) : code ? null : OAUTH_ERRORS.failed,
+    );
+    // The code works once, and React runs effects twice in development: only ask the server once.
+    const asked = useRef(false);
+
+    useEffect(() => {
+        if (!code || errorKey || asked.current) return;
+        asked.current = true;
+        api<{ access_token: string; user: User }>("/auth/oauth/exchange", {
+            method: "POST",
+            body: JSON.stringify({ token: code }),
+        })
+            .then((data) => {
+                setToken(data.access_token);
+                toast.success("Welcome!");
+                router.replace("/dashboard");
+            })
+            .catch((err) => setError(err instanceof Error ? err.message : OAUTH_ERRORS.failed));
+    }, [code, errorKey, router]);
+
+    if (error) {
+        return (
+            <Shell icon={<AlertCircle className="w-6 h-6" />} title="Couldn't sign you in">
+                <ErrorText>{error}</ErrorText>
+                <Link href="/login" className={linkClass}>Back to log in</Link>
+            </Shell>
+        );
+    }
+    return (
+        <Shell icon={<Loader2 className="w-6 h-6 animate-spin" />} title="Signing you in…">
+            <></>
+        </Shell>
+    );
+}
+
 export function VerifyEmail() {
     const router = useRouter();
     const token = useSearchParams().get("token") ?? "";

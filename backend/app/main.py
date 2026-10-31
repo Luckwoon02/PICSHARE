@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import events, photos, guests, auth, payments, selection
+from app.api import events, photos, guests, auth, oauth, payments, selection
 from app.services import live_ingest, photo_worker
 from app.services.db import connect_to_db, close_db_connection
 from app.core.config import get_settings
@@ -18,11 +18,12 @@ async def lifespan(app: FastAPI):
     # single worker (as the Dockerfile does): the queue claims jobs without locking.
     await photo_worker.start()
 
+    # Live mode (FTP/SFTP) is not fully built yet, so it is switched off.
     # Live mode: finds photos that FTP/SFTP clients drop into S3 and hands them to the queue above.
-    await live_ingest.start()
+    # await live_ingest.start()
 
     yield
-    await live_ingest.stop()
+    # await live_ingest.stop()
     await photo_worker.stop()
     await close_db_connection()
 
@@ -32,7 +33,7 @@ app = FastAPI(title="Pixello API", lifespan=lifespan, redirect_slashes=False)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[settings.FRONTEND_URL.rstrip("/")],
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Length"],
@@ -41,6 +42,7 @@ app.add_middleware(
 
 
 app.include_router(auth.router)
+app.include_router(oauth.router)
 app.include_router(events.router)
 app.include_router(payments.router)
 app.include_router(photos.router)

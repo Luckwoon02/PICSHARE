@@ -42,6 +42,19 @@ class Database:
             )
         """)
 
+        # Which outside account (e.g. a Google "sub") signs in as which user. The subject, not the
+        # email, is what identifies the person to the provider, so it survives an email change.
+        await self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_identities (
+                provider TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (provider, subject),
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        """)
+
         await self.connection.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,

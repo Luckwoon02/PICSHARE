@@ -205,21 +205,22 @@ async def update_event(event_id: str, event_data: dict, user: dict = Depends(get
 async def get_event(event_id: str, user: dict = Depends(get_current_user)):
     return format_event(await get_owned_event(event_id, user))
 
-class LiveToggle(BaseModel):
-    enabled: bool
-
-@router.patch("/{event_id}/live", response_model=EventResponse)
-async def set_live_mode(event_id: str, body: LiveToggle, user: dict = Depends(get_current_user)):
-    """
-    Switch live mode on or off. While it is on, photos that land in live/{event_id}/ (FTP/SFTP
-    uploads) are added to the event and processed. Switching it off stops picking up new files;
-    photos already added stay.
-    """
-    await get_owned_active_event(event_id, user)
-    await db.execute("UPDATE events SET live_enabled = ? WHERE id = ?", (int(body.enabled), event_id))
-    if body.enabled:
-        live_ingest.request_scan()  # pick up anything already waiting, don't wait for the next interval
-    return format_event(await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,)))
+# Live mode (FTP/SFTP) is not fully built yet, so the toggle endpoint is switched off.
+# class LiveToggle(BaseModel):
+#     enabled: bool
+#
+# @router.patch("/{event_id}/live", response_model=EventResponse)
+# async def set_live_mode(event_id: str, body: LiveToggle, user: dict = Depends(get_current_user)):
+#     """
+#     Switch live mode on or off. While it is on, photos that land in live/{event_id}/ (FTP/SFTP
+#     uploads) are added to the event and processed. Switching it off stops picking up new files;
+#     photos already added stay.
+#     """
+#     await get_owned_active_event(event_id, user)
+#     await db.execute("UPDATE events SET live_enabled = ? WHERE id = ?", (int(body.enabled), event_id))
+#     if body.enabled:
+#         live_ingest.request_scan()  # pick up anything already waiting, don't wait for the next interval
+#     return format_event(await db.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,)))
 
 @router.get("/{event_id}/storage")
 async def get_event_storage(event_id: str, user: dict = Depends(get_current_user)):

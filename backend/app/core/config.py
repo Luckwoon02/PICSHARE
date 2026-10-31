@@ -25,6 +25,17 @@ class Settings(BaseSettings):
     EMAIL_VERIFY_EXPIRE_HOURS: int = 24
     PASSWORD_RESET_EXPIRE_MINUTES: int = 60
 
+    # --- Sign in with Google (OAuth 2.0 / OpenID Connect) ---
+    # Leave the id and secret empty to switch it off: the button doesn't appear and the endpoints
+    # answer 404. Create the credentials in Google Cloud Console (APIs & Services > Credentials >
+    # OAuth client ID > Web application) and add GOOGLE_REDIRECT_URI as an authorized redirect URI.
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    # Where Google sends the browser back to. Must be this API's /auth/google/callback as the
+    # browser reaches it, on the same host the sign-in started from (the state cookie is tied to it).
+    # Behind the frontend's /api proxy that is e.g. https://pixello.example/api/auth/google/callback.
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/google/callback"
+
     # --- AWS ---
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
