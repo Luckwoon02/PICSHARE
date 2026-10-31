@@ -12,12 +12,6 @@ export function Footer() {
                 <p className="text-sm text-muted-foreground">
                     © 2026 Pixello AI. All rights reserved.
                 </p>
-                <p className="md:pb-0 pb-2 text-sm text-muted-foreground">
-                    Made with <span className="text-red-500 animate-pulse">❤️</span> by{" "}
-                    <span className="font-medium text-foreground">
-                        Kaushik Ghosh
-                    </span>
-                </p>
             </div>
         </footer>
     );

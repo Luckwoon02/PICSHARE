@@ -10,10 +10,11 @@ import { api, formatBytes, formatDateRange, planInfo, type EventItem } from "@/l
 import { useAuth } from "@/lib/use-auth";
 import { StatusBadge } from "@/components/dashboard/status-badge";
 import { UploadPanel } from "@/components/dashboard/upload-panel";
-import { LiveModeCard } from "@/components/dashboard/live-mode-card";
+// import { LiveModeCard } from "@/components/dashboard/live-mode-card";
 import { PhotoGrid, type Photo } from "@/components/dashboard/photo-grid";
 import { GuestsTable, type Guest } from "@/components/dashboard/guests-table";
 import { SelectionPanel } from "@/components/dashboard/selection-panel";
+import { EventQr } from "@/components/dashboard/event-qr";
 
 interface Storage {
     capacity_bytes: number;
@@ -272,6 +273,8 @@ export default function EventDetailClient() {
     // look at the tiny status call now and then and reload the gallery when the photo count has moved. As soon as
     // something is processing, the poller above takes over and this one pauses itself. Events without live mode
     // never run this, so they make no extra requests.
+    // Not fully built yet, so switched off.
+    /*
     const liveOn = event?.live_enabled === true;
     useEffect(() => {
         if (!event || !liveOn || hasWork) return;
@@ -308,6 +311,7 @@ export default function EventDetailClient() {
             document.removeEventListener("visibilitychange", onVisible);
         };
     }, [event, liveOn, hasWork, loadStatus, loadStats, loadPhotos]);
+    */
 
     // When everything has finished, refresh once so the last photos and the storage figure show up.
     // (Live events are skipped: photos keep arriving, so "everything has finished" happens again and again.
@@ -316,13 +320,14 @@ export default function EventDetailClient() {
     useEffect(() => {
         if (!event) return;
         if (hasWork) {
-            wasWorking.current = !liveOn; // live events never arm this: the live check refreshes them
+            wasWorking.current = true;
+            // wasWorking.current = !liveOn; // live events never arm this: the live check refreshes them (live mode is off)
         } else if (wasWorking.current) {
             wasWorking.current = false;
             loadStats();
             loadPhotos();
         }
-    }, [event, hasWork, liveOn, loadStats, loadPhotos]);
+    }, [event, hasWork, loadStats, loadPhotos]);
 
     const refreshAfterChange = () => {
         loadStats();
@@ -406,7 +411,8 @@ export default function EventDetailClient() {
                     </p>
                 </div>
                 {faceScan && (
-                    <div className="flex gap-2">
+                    <div className="flex flex-wrap gap-2">
+                        <EventQr slug={event.slug} eventName={event.name} code={event.secret_code ?? null} />
                         <Button variant="outline" onClick={copyLink}>
                             {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
                             Copy guest link
@@ -463,6 +469,7 @@ export default function EventDetailClient() {
                 </p>
             )}
 
+            {/* Live mode (FTP) is not fully built yet
             <LiveModeCard
                 eventId={id}
                 enabled={liveOn}
@@ -470,6 +477,7 @@ export default function EventDetailClient() {
                 lastLiveAt={progress?.last_live_at ?? null}
                 onChanged={setEvent}
             />
+            */}
 
             {/* Tabs */}
             <div className="space-y-6">
